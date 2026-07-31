@@ -1,0 +1,4 @@
+# Railway build config — install system fonts so node-canvas renders text
+# (default Railway container has zero fonts -> dailyCard/entryCard/exitCard show tofu blocks)
+[phases.setup]
+aptPkgs = ["fonts-dejavu-core", "fontconfig"]
