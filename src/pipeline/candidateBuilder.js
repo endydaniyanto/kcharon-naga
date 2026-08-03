@@ -35,6 +35,16 @@ function isFreshlyGraduated(candidate) {
   return route.includes('pumpportal_graduated') || route.includes('pumpfun_pregrad');
 }
 
+// First finite number from a list of candidate values; null if none present.
+function firstNumber(...values) {
+  for (const v of values) {
+    if (v === null || v === undefined) continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 export function filterCandidate(candidate) {
   const strat = activeStrategy();
   const failures = [];
@@ -47,8 +57,6 @@ export function filterCandidate(candidate) {
   const holderCount = Number(candidate.metrics.holderCount || 0);
   const trendingVolume = Number(candidate.trending?.volume ?? 0);
   const trendingSwaps = Number(candidate.trending?.swaps ?? 0);
-  const rugRatio = Number(candidate.trending?.rug_ratio ?? 0);
-  const bundlerRate = Number(candidate.trending?.bundler_rate ?? 0);
   const freshGrad = isFreshlyGraduated(candidate);
 
   // Fresh grad insufficient data check: v40 pre-filter relies on jupiterAsset.audit (botHolders%, top10, devMigrations).
@@ -206,7 +214,7 @@ export function filterCandidate(candidate) {
     }
   }
 
-  // Trending filters
+  // Trending volume/swap filters — only meaningful when a trending signal exists.
   if (candidate.trending) {
     // BACKTEST 2026-07-07 (B-1): trending_min_volume_usd was INVERTED — it admitted the
     // worse half (trendingVol>=5000 -> -13.87 SOL vs <5000 -> -3.41 SOL). Higher trending
@@ -218,15 +226,41 @@ export function filterCandidate(candidate) {
     if (strat.trending_min_swaps > 0 && trendingSwaps < strat.trending_min_swaps) {
       failures.push(`trending swaps: ${trendingSwaps} < ${strat.trending_min_swaps}`);
     }
-    if (strat.trending_max_rug_ratio > 0 && Number.isFinite(rugRatio) && rugRatio > strat.trending_max_rug_ratio) {
-      failures.push(`trending rug ratio: ${rugRatio} > ${strat.trending_max_rug_ratio}`);
+  }
+
+  // Anti-rug / anti-bundler / wash-trading gates — ALL routes, not just trending signals.
+  // The signal layer (trendingSignalPass) pre-filters trending rows; this block is defense-in-depth
+  // so non-trending routes (pumpportal_graduated, fee, graduated, trenches) cannot bypass the gates.
+  // Threshold semantics: <= 0 or >= 1 disables a gate (1.0 = 100% = no limit). When enabled
+  // (0 < threshold < 1), missing data is a REJECT — a token that cannot be verified is not bought.
+  const maxRugRatio = Number(strat.trending_max_rug_ratio ?? 0);
+  const maxBundlerRate = Number(strat.trending_max_bundler_rate ?? 0);
+  const rugRatio = firstNumber(candidate.trending?.rug_ratio, candidate.gmgn?.rug_ratio);
+  const botHoldersPct = candidate.jupiterAsset?.audit?.botHoldersPercentage;
+  const bundlerRate = firstNumber(
+    candidate.trending?.bundler_rate,
+    candidate.gmgn?.bundler_rate,
+    Number.isFinite(Number(botHoldersPct)) ? Number(botHoldersPct) / 100 : null,
+  );
+  const washTrading = candidate.trending?.is_wash_trading === true || candidate.trending?.is_wash_trading === 1
+    || candidate.gmgn?.is_wash_trading === true || candidate.gmgn?.is_wash_trading === 1;
+
+  if (maxRugRatio > 0 && maxRugRatio < 1) {
+    if (rugRatio === null) {
+      failures.push(`rug ratio: no data (max ${maxRugRatio})`);
+    } else if (rugRatio > maxRugRatio) {
+      failures.push(`rug ratio: ${rugRatio} > ${maxRugRatio}`);
     }
-    if (strat.trending_max_bundler_rate > 0 && Number.isFinite(bundlerRate) && bundlerRate > strat.trending_max_bundler_rate) {
-      failures.push(`trending bundler rate: ${bundlerRate} > ${strat.trending_max_bundler_rate}`);
+  }
+  if (maxBundlerRate > 0 && maxBundlerRate < 1) {
+    if (bundlerRate === null) {
+      failures.push(`bundler rate: no data (max ${maxBundlerRate})`);
+    } else if (bundlerRate > maxBundlerRate) {
+      failures.push(`bundler rate: ${bundlerRate} > ${maxBundlerRate}`);
     }
-    if (candidate.trending.is_wash_trading === true || candidate.trending.is_wash_trading === 1) {
-      failures.push('trending wash trading');
-    }
+  }
+  if (washTrading) {
+    failures.push('wash trading');
   }
 
   // Token age check — reject tokens older than token_age_max_ms (default 12 hours)
@@ -234,13 +268,20 @@ export function filterCandidate(candidate) {
   if (tokenAgeMs > 0) {
     const trenchesCreatedTs = candidate.trenchesEntry?.created_timestamp;
     const graduatedTs = candidate.graduation?.graduationDate || candidate.graduation?.seenAt;
-    const tokenCreatedTs = trenchesCreatedTs || graduatedTs;
+    // S1-3: GMGN token-info carries creation_timestamp (unix s) on every enriched route — without
+    // it the age cap was silently skipped for non-fresh routes (trending, fee, graduated) that have
+    // no trenchesEntry/graduation. Trending rows have no timestamp of their own; gmgn is the source.
+    const gmgnCreatedTs = candidate.gmgn?.creation_timestamp || candidate.gmgn?.open_timestamp;
+    const tokenCreatedTs = trenchesCreatedTs || graduatedTs || gmgnCreatedTs;
     if (tokenCreatedTs > 0) {
       const tokenAgeMsActual = now() - (tokenCreatedTs > 1e12 ? tokenCreatedTs : tokenCreatedTs * 1000);
       if (tokenAgeMsActual > tokenAgeMs) {
         const ageH = (tokenAgeMsActual / 3600000).toFixed(1);
         failures.push(`token age: ${ageH}h > max ${tokenAgeMs / 3600000}h`);
       }
+    } else {
+      // S1-3: no creation timestamp anywhere (enrichment failed) -> cannot verify the age cap -> reject
+      failures.push(`token age: unknown (cannot verify <= max ${tokenAgeMs / 3600000}h)`);
     }
   }
 
@@ -258,8 +299,13 @@ export function filterCandidate(candidate) {
   // lucky bucket. Fresh-grads are NOT exempted: their liq<6000 subset lost -2.43 SOL
   // (WR 31%), so exempting them cut total to +2.94. Read from candidate.metrics.liquidityUsd
   // (same field the backtest measured). See BACKTEST_EDGE_2026-07-07.md.
+  // S1-2: the old `liquidity > 0 &&` guard let enrichment failures (gmgn null + jupiterAsset null
+  // -> liquidity reads 0) bypass the floor entirely. 0 now rejects: the floor is the strongest
+  // backtested filter and an unverifiable pool must not sail past it. Fresh grads already fail via
+  // the fresh-grad insufficient-data check when jupiterAsset is null/liquidity=$0, so this mainly
+  // closes the gap on non-fresh routes (trending, fee, graduated, trenches).
   const liquidity = Number(candidate.metrics?.liquidityUsd || candidate.gmgn?.pool?.liquidity || candidate.gmgn?.liquidity || 0);
-  if (liquidity > 0 && liquidity < 6000) {
+  if (liquidity < 6000) {
     failures.push(`DEX liquidity too low: $${liquidity.toFixed(0)} < $6000`);
   }
 
