@@ -31,7 +31,11 @@ export function runDailyWipe() {
     // Reclaim file space. SQLite would reuse freed pages anyway (file would
     // plateau at peak), but VACUUM keeps the file compact and the volume math
     // predictable. Runs post-delete on a ~460MB DB, so the stall is small.
-    db.pragma('VACUUM');
+    // NOTE: must use db.exec() — db.pragma('VACUUM') silently no-ops.
+    // In WAL mode the vacuum lands in the WAL, so checkpoint(TRUNCATE) after
+    // to physically shrink the main file and truncate the WAL.
+    db.exec('VACUUM');
+    db.pragma('wal_checkpoint(TRUNCATE)');
 
     const afterBytes = dbSizeBytes(db);
     const result = {
