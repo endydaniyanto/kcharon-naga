@@ -7,6 +7,7 @@ import { monitorPositions } from './execution/positions.js';
 import { processCandidateFromSignals, maybeProcessDegenCandidate } from './pipeline/orchestrator.js';
 import { sendTelegram } from './telegram/send.js';
 import { makeFailureTracker } from './utils.js';
+import { scheduleDailyWipe } from './scripts/dailyWipe.js';
 
 setDefaultResultOrder('ipv4first');
 validateConfig();
@@ -98,4 +99,14 @@ export async function startCharon() {
       positionMonitorRunning = false;
     }
   }, POSITION_CHECK_MS);
+
+  // Daily maintenance: snapshot + wipe candidates/llm_decisions at 00:00 UTC.
+  // Only this service can reach /data (volume is single-service).
+  scheduleDailyWipe((err, result) => {
+    if (err) {
+      sendTelegram(`⚠️ Daily wipe FAILED: ${err.message}`).catch(() => {});
+    } else {
+      sendTelegram(`🧹 Daily wipe done: ${result.beforeMB}MB → ${result.afterMB}MB (freed ${result.freedMB}MB, snapshot ${result.snapshotMB}MB)`).catch(() => {});
+    }
+  });
 }
