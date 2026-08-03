@@ -13,7 +13,7 @@ function dbSizeBytes(db) {
   return db.pragma('page_count', { simple: true }) * db.pragma('page_size', { simple: true });
 }
 
-export function runDailyWipe() {
+export async function runDailyWipe() {
   const started = Date.now();
   const db = new Database(DB_PATH);
   const beforeBytes = dbSizeBytes(db);
@@ -35,7 +35,13 @@ export function runDailyWipe() {
     // In WAL mode the vacuum lands in the WAL, so checkpoint(TRUNCATE) after
     // to physically shrink the main file and truncate the WAL.
     db.exec('VACUUM');
-    db.pragma('wal_checkpoint(TRUNCATE)');
+    // TRUNCATE can return busy while the bot is mid-write; retry until clean
+    // so the WAL doesn't balloon after VACUUM.
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const res = db.pragma('wal_checkpoint(TRUNCATE)')[0];
+      if (res.busy === 0 && res.log === 0) break;
+      await new Promise(r => setTimeout(r, 2000));
+    }
 
     const afterBytes = dbSizeBytes(db);
     const result = {
@@ -63,7 +69,7 @@ export function scheduleDailyWipe(onComplete) {
     if (utcMin >= 0 && utcMin < 5 && lastWipeDay !== todayKey) {
       lastWipeDay = todayKey;
       try {
-        const result = runDailyWipe();
+        const result = await runDailyWipe();
         if (typeof onComplete === 'function') onComplete(null, result);
       } catch (err) {
         console.error('[dailyWipe] failed:', err.message);
