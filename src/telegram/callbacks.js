@@ -21,7 +21,7 @@ import { sendTelegram, sendBatch, sendPositionOpen, sendTradeIntent } from './se
 import { candidateSummary } from './format.js';
 import { candidateById, updateCandidateStatus } from '../db/candidates.js';
 import { storeDecision, logDecisionEvent } from '../db/decisions.js';
-import { createDryRunPosition, canOpenMorePositions, openPositionCount, tradingMode } from '../db/positions.js';
+import { createDryRunPosition, canOpenMorePositions, openPositionCount, tradingMode, effectiveModeFor } from '../db/positions.js';
 import { executeLiveBuy, executeConfirmedIntent, rejectIntent } from '../execution/router.js';
 import { sendCandidate, sendPosition, closePosition, updatePositionRule, toggleTrailing } from './commands.js';
 import { requestNumericFilterInput, requestStrategyNumericInput } from './input.js';
@@ -94,14 +94,18 @@ export async function handleCallback(query) {
   if (kind === 'buy') {
     const row = candidateById(Number(id));
     if (!row) return bot.sendMessage(chatId, 'Candidate not found.');
-    if (!canOpenMorePositions()) {
-      return bot.sendMessage(chatId, `Max open positions reached (${openPositionCount()}/${numSetting('max_open_positions', 3)}). Close one first or raise the limit.`);
-    }
     const candidate = row.candidate;
+    // Per-source execution gate (2026-08-05): manual buys are single-mode — in global
+    // live mode only pumpportal_graduated executes live; every other source falls back
+    // to dry_run. confirm is untouched.
+    const mode = effectiveModeFor(candidate, tradingMode());
+    if (!canOpenMorePositions(mode)) {
+      return bot.sendMessage(chatId, `Max ${mode} positions reached (${openPositionCount(mode)}/${numSetting('max_open_positions', 3)}). Close one first or raise the limit.`);
+    }
     const decision = { verdict: 'BUY', confidence: 100, reason: 'Manual dry buy', risks: [], suggested_tp_percent: numSetting('default_tp_percent', 50), suggested_sl_percent: numSetting('default_sl_percent', -25) };
     const decisionId = storeDecision(row.id, candidate, decision);
     decision.id = decisionId;
-    if (tradingMode() === 'live') {
+    if (mode === 'live') {
       await executeLiveBuy(row, decision, 'manual', [row], row.id);
       return;
     }
@@ -112,7 +116,7 @@ export async function handleCallback(query) {
       selectedRow: row,
       rows: [row],
       decision,
-      mode: tradingMode(),
+      mode,
       action: 'manual_dry_run_entry',
       execution: { positionId },
     });

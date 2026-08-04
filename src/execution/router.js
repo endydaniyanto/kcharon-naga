@@ -111,8 +111,9 @@ export async function executeLiveSell(position, reason) {
 export async function executeConfirmedIntent(chatId, intentId) {
   const intent = intentById(intentId);
   if (!intent || intent.status !== 'pending_confirmation') return bot.sendMessage(chatId, 'Pending intent not found.');
-  if (!canOpenMorePositions()) {
-    return bot.sendMessage(chatId, `Max open positions reached (${openPositionCount()}/${numSetting('max_open_positions', 3)}).`);
+  // Confirm approval always executes live (2026-08-05 decision) — check the live track's slots.
+  if (!canOpenMorePositions('live')) {
+    return bot.sendMessage(chatId, `Max live positions reached (${openPositionCount('live')}/${numSetting('max_open_positions', 3)}).`);
   }
   const { decision } = intent.payload;
   try {

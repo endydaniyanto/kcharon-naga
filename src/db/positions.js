@@ -6,7 +6,12 @@ export function openPositions() {
   return db.prepare('SELECT * FROM dry_run_positions WHERE status = ? ORDER BY opened_at_ms DESC').all('open');
 }
 
-export function openPositionCount() {
+export function openPositionCount(executionMode = null) {
+  // Per-mode slot counting (2026-08-05): pass 'live' or 'dry_run' to count only that
+  // track's open positions; null counts all modes (legacy behavior).
+  if (executionMode) {
+    return db.prepare('SELECT COUNT(*) AS count FROM dry_run_positions WHERE status = ? AND COALESCE(execution_mode, ?) = ?').get('open', 'dry_run', executionMode).count;
+  }
   return db.prepare('SELECT COUNT(*) AS count FROM dry_run_positions WHERE status = ?').get('open').count;
 }
 
@@ -17,16 +22,32 @@ export function hasClosedPosition(mint) {
   return !!row;
 }
 
-export function canOpenMorePositions() {
+export function canOpenMorePositions(executionMode = null) {
   const strat = activeStrategy();
   const max = strat.max_open_positions ?? numSetting('max_open_positions', 3);
   if (max <= 0) return true;
-  return openPositionCount() < max;
+  return openPositionCount(executionMode) < max;
 }
 
 export function tradingMode() {
   const mode = setting('trading_mode', 'dry_run');
   return ['dry_run', 'confirm', 'live'].includes(mode) ? mode : 'dry_run';
+}
+
+// Route-based execution gating (2026-08-05, user decision): the global mode applies to
+// all sources, EXCEPT when the global mode is 'live' — then only pumpportal_graduated
+// candidates execute live and everything else falls back to dry_run.
+// confirm mode is intentionally untouched: approve = live for any source.
+export function candidateRoute(candidate) {
+  if (!candidate) return '';
+  const sig = candidate.signals || candidate.signal || {};
+  const route = Array.isArray(sig) ? (sig[0] && sig[0].route) : (sig.route || candidate.route);
+  return String(route || '');
+}
+
+export function effectiveModeFor(candidate, globalMode) {
+  if (globalMode !== 'live') return globalMode;
+  return candidateRoute(candidate).includes('pumpportal_graduated') ? 'live' : 'dry_run';
 }
 
 export function allPositions(limit = 10) {
@@ -59,13 +80,13 @@ export function createDryRunPosition(candidateId, candidate, decision, reason = 
 
   return db.transaction(() => {
     const existing = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1
+      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' AND COALESCE(execution_mode, 'dry_run') = 'dry_run' LIMIT 1
     `).get(candidate.token.mint);
     if (existing) return { id: existing.id, isNew: false };
 
-    // Dedup: block re-entry if this token has been closed within 24 hours
+    // Dedup: block re-entry if this token has been closed within 24 hours (dry track only)
     const recentClosed = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND closed_at_ms > ? LIMIT 1
+      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND closed_at_ms > ? AND COALESCE(execution_mode, 'dry_run') = 'dry_run' LIMIT 1
     `).get(candidate.token.mint, now() - 86400000);
     if (recentClosed) {
       console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — closed <24h ago`);
@@ -78,6 +99,7 @@ export function createDryRunPosition(candidateId, candidate, decision, reason = 
       SELECT id, pnl_sol, closed_at_ms FROM dry_run_positions
       WHERE mint = ? AND status = 'closed' AND pnl_percent > 0
         AND closed_at_ms > ?
+        AND COALESCE(execution_mode, 'dry_run') = 'dry_run'
       ORDER BY closed_at_ms DESC LIMIT 1
     `).get(candidate.token.mint, now() - WIN_BLOCK_DAYS * 86400000);
     if (pastWin) {
@@ -135,22 +157,22 @@ export function createLivePosition(candidateId, candidate, decision, swap, reaso
 
   return db.transaction(() => {
     const existing = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1
+      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' AND execution_mode = 'live' LIMIT 1
     `).get(candidate.token.mint);
     if (existing) return { id: existing.id, isNew: false };
 
-    // Dedup: block re-entry if this token has been closed within 24 hours
+    // Dedup: block re-entry if this token has been closed within 24 hours (live track only)
     const recentClosed = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND closed_at_ms > ? LIMIT 1
+      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND closed_at_ms > ? AND execution_mode = 'live' LIMIT 1
     `).get(candidate.token.mint, now() - 86400000);
     if (recentClosed) {
       console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — closed <24h ago (live)`);
       return { id: recentClosed.id, isNew: false };
     }
 
-    // Block re-entry if this mint ever had a winning trade (avoid round-trip losses)
+    // Block re-entry if this mint ever had a winning live trade (avoid round-trip losses)
     const pastWin = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND pnl_percent > 0 LIMIT 1
+      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND pnl_percent > 0 AND execution_mode = 'live' LIMIT 1
     `).get(candidate.token.mint);
     if (pastWin) {
       console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — past WIN exists (live)`);

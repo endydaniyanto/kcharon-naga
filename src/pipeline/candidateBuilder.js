@@ -6,7 +6,7 @@ import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { fetchTwitterNarrative } from '../enrichment/twitter.js';
 import { gmgnLink } from '../format.js';
 import { effectivePositionSizeSol } from './llm.js';
-import { openPositionCount } from '../db/positions.js';
+import { openPositionCount, effectiveModeFor, tradingMode } from '../db/positions.js';
 
 export function buildFeeSnapshot(fee, signature) {
   return {
@@ -334,8 +334,8 @@ export function filterCandidate(candidate) {
   // Score >= soft_threshold: PASS to LLM. Below: REJECT (unless hard_floor_override).
   const softScore = computeSoftScore(candidate, strat, freshGrad);
   
-  // Dynamic threshold: tighten when many positions open, loosen when idle
-  const softThreshold = softScoreThreshold(strat);
+  // Dynamic threshold: tighten when many positions open in this track, loosen when idle
+  const softThreshold = softScoreThreshold(strat, effectiveModeFor(candidate, tradingMode()));
   
   if (softScore < softThreshold) {
     failures.push(`soft score: ${softScore} < threshold ${softThreshold}`);
@@ -466,12 +466,12 @@ function computeSoftScore(candidate, strat, isFreshGrad) {
   return Math.max(0, Math.min(150, score));
 }
 
-function softScoreThreshold(strat) {
-  // Dynamic threshold based on current load
+function softScoreThreshold(strat, mode = null) {
+  // Dynamic threshold based on current load (per-mode since 2026-08-05)
   const baseThreshold = 30; // Default threshold (loosen from 50 — too aggressive)
   
-  // Tighten when many positions open
-  const openCount = globalOpenPositionCount();
+  // Tighten when many positions open in this track
+  const openCount = globalOpenPositionCount(mode);
   const maxOpen = strat.max_open_positions || 3;
   
   if (openCount >= maxOpen - 1) return baseThreshold + 10; // Tighten: 60
@@ -479,14 +479,14 @@ function softScoreThreshold(strat) {
   return baseThreshold; // Normal: 50
 }
 
-function globalOpenPositionCount() {
+function globalOpenPositionCount(mode = null) {
   // BACKTEST 2026-07-07 (B-4): the old body did require('./positions.js') inside a
   // try/catch. In this ESM project require is undefined AND the path was wrong
   // (positions.js lives in ../db/), so it ALWAYS threw and returned 0 — pinning the
   // soft-score threshold at the loosest branch (20) forever. Now uses a static ESM
   // import so the dynamic tighten-when-full logic actually works.
   try {
-    return openPositionCount();
+    return openPositionCount(mode);
   } catch {
     return 0;
   }

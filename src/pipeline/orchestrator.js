@@ -8,7 +8,7 @@ import { preScoreCandidate } from './preScorer.js';
 import { momentumFilter } from './momentumFilter.js';
 import { decideCandidateBatch } from './llm.js';
 import { activeStrategy } from '../db/settings.js';
-import { createDryRunPosition, createLivePosition, canOpenMorePositions, openPositionCount, tradingMode } from '../db/positions.js';
+import { createDryRunPosition, createLivePosition, canOpenMorePositions, openPositionCount, tradingMode, effectiveModeFor } from '../db/positions.js';
 import { sendBatchReveal, sendTelegram, sendPositionOpen, sendTradeIntent } from '../telegram/send.js';
 import { candidateSummary } from '../telegram/format.js';
 import { createTradeIntent } from '../db/intents.js';
@@ -26,10 +26,13 @@ setDegenHandler(maybeProcessDegenCandidate);
 setCandidateHandler(processCandidateFromSignals);
 
 export async function processCandidateFromSignals(signals) {
+  // Per-mode slot gate (2026-08-05): check the track this candidate would execute in
+  // (live for pumpportal_graduated, dry_run otherwise).
+  const mode = effectiveModeFor(signals, tradingMode());
   // Skip if max positions reached — don't waste enrichment/LLM calls
-  if (!canOpenMorePositions()) {
+  if (!canOpenMorePositions(mode)) {
     const max = numSetting('max_open_positions', 3);
-    console.log(`[agent] max positions reached (${openPositionCount()}/${max}), skipping ${signals.mint.slice(0, 8)}...`);
+    console.log(`[agent] max ${mode} positions reached (${openPositionCount(mode)}/${max}), skipping ${signals.mint.slice(0, 8)}...`);
     return;
   }
 
@@ -40,19 +43,19 @@ export async function processCandidateFromSignals(signals) {
   try {
     const recentMs = Date.now() - 86400000; // 24 hours
 
-    // 1. Open position exists
+    // 1. Open position exists (same track only — live/dry twins allowed)
     const openPos = db.prepare(
-      'SELECT id FROM dry_run_positions WHERE mint = ? AND status = ? LIMIT 1'
-    ).get(signals.mint, 'open');
+      'SELECT id FROM dry_run_positions WHERE mint = ? AND status = ? AND COALESCE(execution_mode, ?) = ? LIMIT 1'
+    ).get(signals.mint, 'open', 'dry_run', mode);
     if (openPos) {
-      console.log(`[agent] skipping ${signals.mint.slice(0, 8)}... — already has open position`);
+      console.log(`[agent] skipping ${signals.mint.slice(0, 8)}... — already has open ${mode} position`);
       return;
     }
 
-    // 2. Recently closed position (<24h) — BUG #3 FIX: extend to 72h to prevent re-buy after SL
+    // 2. Recently closed position (<72h, same track only) — BUG #3 FIX: extend to 72h to prevent re-buy after SL
     const closedPos = db.prepare(
-      'SELECT id, exit_reason, closed_at_ms FROM dry_run_positions WHERE mint = ? AND status = ? AND closed_at_ms > ? ORDER BY closed_at_ms DESC LIMIT 1'
-    ).get(signals.mint, 'closed', Date.now() - 72 * 60 * 60 * 1000);
+      'SELECT id, exit_reason, closed_at_ms FROM dry_run_positions WHERE mint = ? AND status = ? AND COALESCE(execution_mode, ?) = ? AND closed_at_ms > ? ORDER BY closed_at_ms DESC LIMIT 1'
+    ).get(signals.mint, 'closed', 'dry_run', mode, Date.now() - 72 * 60 * 60 * 1000);
     if (closedPos) {
       const hoursAgo = ((Date.now() - closedPos.closed_at_ms) / 3600000).toFixed(1);
       console.log(`[agent] skipping ${signals.mint.slice(0, 8)}... — recently closed (${hoursAgo}h ago, exit: ${closedPos.exit_reason})`);
@@ -203,9 +206,10 @@ export async function processCandidateFromSignals(signals) {
 
   // #6: Buy the LLM's selected candidate regardless of which candidate triggered the batch
   if (selectedRow && boolSetting('agent_enabled', true) && batchDecision.verdict === 'BUY' && batchDecision.confidence >= numSetting('llm_min_confidence')) {
-    if (!canOpenMorePositions()) {
+    const mode = effectiveModeFor(selectedRow.candidate, tradingMode());
+    if (!canOpenMorePositions(mode)) {
       const max = numSetting('max_open_positions', 3);
-      console.log(`[agent] max open positions reached (${openPositionCount()}/${max}), skipping buy ${selectedRow.candidate.token.mint}`);
+      console.log(`[agent] max ${mode} positions reached (${openPositionCount(mode)}/${max}), skipping buy ${selectedRow.candidate.token.mint}`);
       logDecisionEvent({
         batchId,
         triggerCandidateId: candidateId,
@@ -213,7 +217,7 @@ export async function processCandidateFromSignals(signals) {
         rows,
         decision: batchDecision,
         action: 'entry_skipped_max_positions',
-        guardrails: { maxOpenPositions: max, openPositions: openPositionCount() },
+        guardrails: { maxOpenPositions: max, openPositions: openPositionCount(mode) },
       });
       return;
     }
@@ -257,7 +261,9 @@ export async function processCandidateFromSignals(signals) {
 }
 
 export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
-  const mode = tradingMode();
+  // Per-source execution gate (2026-08-05): in global live mode, only pumpportal_graduated
+  // candidates execute live; every other source falls back to dry_run. confirm is untouched.
+  const mode = effectiveModeFor(selectedRow.candidate, tradingMode());
   // Fire-and-forget refresh — start now, await later. Wrapped so a refresh failure
   // doesn't kill the trade — we just fall back to the unrefreshed row.
   const refreshPromise = refreshCandidateForExecution(selectedRow).catch(err => {
@@ -312,7 +318,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
         action: 'dry_run_position_create_failed',
         guardrails: {
           maxOpenPositions: numSetting('max_open_positions', 3),
-          openPositions: openPositionCount(),
+          openPositions: openPositionCount(mode),
         },
         execution: { 
           error: err.message,
@@ -332,7 +338,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
     // FIX #4: Enhanced past-win guard logging with context
     const guardrails = {
       maxOpenPositions: numSetting('max_open_positions', 3),
-      openPositions: openPositionCount(),
+      openPositions: openPositionCount(mode),
       pastWinPnlSol: pastWinPnlSol ?? null,
       pastWinClosedAtMs: pastWinClosedAtMs ?? null,
     };
@@ -390,11 +396,23 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       decision,
       mode,
       action: 'confirm_intent_created',
-      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
+      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount('live') },
       execution: { intentId },
     });
     await sendTradeIntent(intentId, freshSelectedRow.candidate, decision);
     return;
+  }
+
+  // Shadow twin (2026-08-05): in live mode, pumpportal_graduated also opens a dry-run
+  // twin so live and dry outcomes can be compared. Twin is created FIRST so it stands
+  // even if the live swap fails (pure counterfactual). Twin failures never block live.
+  try {
+    const twin = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `shadow_twin_${batchId}`);
+    if (twin.isNew) {
+      console.log(`[shadow] dry twin #${twin.id} opened for ${freshSelectedRow.candidate.token.symbol} — live execution pending`);
+    }
+  } catch (twinErr) {
+    console.error(`[shadow] dry twin failed for ${freshSelectedRow.candidate.token.symbol}: ${twinErr.message}`);
   }
 
   try {
@@ -409,7 +427,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       decision,
       mode,
       action: 'live_entry_failed',
-      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount() },
+      guardrails: { maxOpenPositions: numSetting('max_open_positions', 3), openPositions: openPositionCount('live') },
       execution: { intentId, error: err.message },
     });
     await sendTelegram([
