@@ -26,9 +26,17 @@ setDegenHandler(maybeProcessDegenCandidate);
 setCandidateHandler(processCandidateFromSignals);
 
 export async function processCandidateFromSignals(signals) {
+  const globalMode = tradingMode();
   // Per-mode slot gate (2026-08-05): check the track this candidate would execute in
   // (live for pumpportal_graduated, dry_run otherwise).
-  const mode = effectiveModeFor(signals, tradingMode());
+  const mode = effectiveModeFor(signals, globalMode);
+  // Shadow mirror (2026-08-05, Option A): in global live mode ONLY pumpportal_graduated
+  // opens positions (live + dry twin). Every other source is screened but opens nothing,
+  // keeping the dry track a pure mirror of live.
+  if (globalMode === 'live' && mode !== 'live') {
+    console.log(`[shadow] non-pumpportal source skipped in live mode (dry track reserved for twins): ${signals.route || signals.signals?.route || '?'} ${signals.mint.slice(0, 8)}...`);
+    return;
+  }
   // Skip if max positions reached — don't waste enrichment/LLM calls
   if (!canOpenMorePositions(mode)) {
     const max = numSetting('max_open_positions', 3);
@@ -264,6 +272,13 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
   // Per-source execution gate (2026-08-05): in global live mode, only pumpportal_graduated
   // candidates execute live; every other source falls back to dry_run. confirm is untouched.
   const mode = effectiveModeFor(selectedRow.candidate, tradingMode());
+  // Shadow mirror (2026-08-05, Option A): in live mode ONLY pumpportal_graduated opens
+  // ANY position. Stale non-pumpportal candidates (built before this gate) are screened
+  // but not traded — the dry track stays a pure mirror of live.
+  if (tradingMode() === 'live' && mode !== 'live') {
+    console.log(`[shadow] buy skipped — non-pumpportal source in live mode (${selectedRow.candidate.token.symbol} ${selectedRow.candidate.token.mint.slice(0, 8)})`);
+    return;
+  }
   // Fire-and-forget refresh — start now, await later. Wrapped so a refresh failure
   // doesn't kill the trade — we just fall back to the unrefreshed row.
   const refreshPromise = refreshCandidateForExecution(selectedRow).catch(err => {

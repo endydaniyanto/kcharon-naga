@@ -30,6 +30,7 @@ import { consumeNumericFilterInput } from './input.js';
 import { runLearning, sendLessons } from '../learning/commands.js';
 import { fetchWalletPnl } from '../enrichment/wallets.js';
 import { sendDailyReport } from './dailyReport.js';
+import { handleFlush } from './flush.js';
 
 export async function handleMessage(msg) {
   const text = (msg.text || '').trim();
@@ -38,6 +39,7 @@ export async function handleMessage(msg) {
   if (!text.startsWith('/')) return;
   if (text.startsWith('/menu')) return sendMenu(chatId);
   if (text.startsWith('/positions')) return sendPositions(chatId);
+  if (text.startsWith('/flush')) return handleFlush(chatId, text);
   if (text.startsWith('/filters')) return bot.sendMessage(chatId, filtersText(), { parse_mode: 'HTML' });
   if (text.startsWith('/strategy')) {
     const parts = text.split(/\s+/);
@@ -244,6 +246,7 @@ export function setupTelegram() {
     { command: 'strategy', description: 'Show/switch strategy' },
     { command: 'stratset', description: 'Set strategy config (stratset id key value)' },
     { command: 'positions', description: 'Show dry-run positions' },
+    { command: 'flush', description: 'Close all open positions (live + dry) — /flush confirm' },
     { command: 'candidate', description: 'Show candidate by mint' },
     { command: 'filters', description: 'Show filters' },
     { command: 'pnl', description: 'Show saved-wallet PnL' },

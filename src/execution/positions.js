@@ -124,7 +124,7 @@ export async function refreshCandidateForExecution(row) {
 
 const sellInProgress = new Set();
 
-export async function refreshPosition(position, { autoExit = true, jupiterPnl = null } = {}) {
+export async function refreshPosition(position, { autoExit = true, jupiterPnl = null, forceExit = false } = {}) {
   // Bug2 fix (2026-06-19): bypass 20s cache for live monitoring — flash crash detection requires fresh data
   // Quote-first (2026-07-24): dry_run exit decisions use executable Jupiter quote (live pool
   // reserves) as primary price — datapi mark is stale by design. Mark = fallback on 429/backoff.
@@ -263,6 +263,11 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
     else if (tpHit && !position.trailing_enabled) exitReason = 'TP';
     else if (trailingHit) exitReason = 'TRAILING_TP';
   }
+
+  // FLUSH override (2026-08-05): /flush force-closes regardless of TP/SL state.
+  // Reuses the exact same close paths below (live = real sell + realized PnL,
+  // dry = marked-to-market PnL), so the audit trail stays consistent.
+  if (forceExit) exitReason = 'FLUSH';
 
 
   // Live exits will override these with realized SOL values
