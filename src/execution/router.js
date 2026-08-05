@@ -87,28 +87,37 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
     throw lastError || new Error('Live buy failed without exception');
   }
   // E1 (2026-08-05): record the ACTUAL fill-derived entry price/mcap when derivable.
-  // swap.outputAmount = raw tokens received; decimals from the execution-refreshed
-  // candidate's Jupiter asset. Guards: valid decimals, positive SOL/USD, and a sanity
-  // band vs the mark (a >50% deviation almost certainly means a decimals/supply
-  // mismatch, not a real fill — keep the mark in that case).
+  // swap.outputAmount = raw tokens received; decimals + totalSupply from the
+  // execution-refreshed candidate's Jupiter asset (mark-INDEPENDENT — the asset mark
+  // is often stale for freshly graduated tokens: BULLMOJI 3.65x / PEW 1.78x, 2026-08-05).
+  // Band widened to 10x: its only job now is catching unit/decimals-order derivation
+  // errors (decimals 6v9 = 1000x, raw-vs-token supply = 1e6x), NOT mark staleness.
+  // Loud log when correcting a >50% deviation (the stale-mark signature).
   let entryOverrides = null;
   try {
     const decimals = Number(candidate.jupiterAsset?.decimals);
     const rawTokens = Number(swap.outputAmount || 0);
     const markPrice = Number(candidate.metrics?.priceUsd || 0);
     const markMcap = Number(candidate.metrics?.marketCapUsd || candidate.metrics?.graduatedMarketCapUsd || 0);
-    if (rawTokens > 0 && Number.isFinite(decimals) && decimals > 0 && markPrice > 0 && markMcap > 0) {
+    if (rawTokens > 0 && Number.isFinite(decimals) && decimals > 0 && markPrice > 0) {
       const tokenCount = rawTokens / Math.pow(10, decimals);
+      const assetSupply = Number(candidate.jupiterAsset?.totalSupply || candidate.jupiterAsset?.circSupply || 0);
+      const supplyTokens = assetSupply > 0 ? assetSupply : (markMcap / markPrice);
       const solUsd = await fetchSolUsdPriceCached();
-      if (Number.isFinite(solUsd) && solUsd > 0 && tokenCount > 0) {
+      if (Number.isFinite(solUsd) && solUsd > 0 && tokenCount > 0 && supplyTokens > 0) {
         const fillPriceUsd = (amountLamports / 1_000_000_000) / tokenCount * solUsd;
-        const fillMcap = fillPriceUsd * (markMcap / markPrice);
+        const fillMcap = fillPriceUsd * supplyTokens;
         if (Number.isFinite(fillPriceUsd) && fillPriceUsd > 0 && Number.isFinite(fillMcap) && fillMcap > 0
-            && Math.abs(fillPriceUsd / markPrice - 1) <= 0.5) {
+            && Math.abs(fillPriceUsd / markPrice - 1) <= 9) {
           entryOverrides = { entryPrice: fillPriceUsd, entryMcap: fillMcap };
-          console.log(`[executeLiveBuy] entry fill override: mark ${markPrice.toFixed(8)} -> fill ${fillPriceUsd.toFixed(8)} (mcap ${markMcap.toFixed(0)} -> ${fillMcap.toFixed(0)})`);
+          const ratio = fillPriceUsd / markPrice;
+          if (ratio > 1.5 || ratio < 0.5) {
+            console.log(`[executeLiveBuy] entry fill override: mark ${markPrice.toFixed(8)} -> fill ${fillPriceUsd.toFixed(8)} (mcap ${markMcap.toFixed(0)} -> ${fillMcap.toFixed(0)}) — CORRECTED STALE MARK (fill/mark=${ratio.toFixed(2)}x)`);
+          } else {
+            console.log(`[executeLiveBuy] entry fill override: mark ${markPrice.toFixed(8)} -> fill ${fillPriceUsd.toFixed(8)} (mcap ${markMcap.toFixed(0)} -> ${fillMcap.toFixed(0)})`);
+          }
         } else {
-          console.log(`[executeLiveBuy] entry fill override SKIPPED (outside sanity band): fill/mark=${(fillPriceUsd / markPrice).toFixed(3)}`);
+          console.log(`[executeLiveBuy] entry fill override SKIPPED (outside 10x band): fill/mark=${(fillPriceUsd / markPrice).toFixed(3)}`);
         }
       }
     }
