@@ -7,7 +7,7 @@ import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext, fetch
 import { liveWalletPubkey } from '../liveExecutor.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
-import { openPositions } from '../db/positions.js';
+import { openPositions, createDryRunPosition } from '../db/positions.js';
 import { updateCandidateSnapshot } from '../db/candidates.js';
 import { trending } from '../signals/trending.js';
 import { executeLiveSell } from './router.js';
@@ -405,6 +405,86 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   };
 }
 
+// Deferred dry-entry backfill (2026-08-06, pure-dry): when a pure-dry entry is skipped
+// because the candidate-time quote anchor failed (fail-closed), queue it here and open it
+// at the first per-tick quote that succeeds — honest quote anchor, no stale marks.
+const deferredDryEntries = new Map(); // mint -> { candidateId, candidate, decision, symbol, batchId, skippedAtMs }
+const DEFERRED_DRY_TTL_MS = 10 * 60 * 1000;
+const DEFERRED_DRY_MAX = 25;
+
+export function queueDeferredDryEntry(mint, entry) {
+  if (deferredDryEntries.size >= DEFERRED_DRY_MAX) {
+    const oldest = deferredDryEntries.keys().next().value;
+    deferredDryEntries.delete(oldest);
+  }
+  deferredDryEntries.set(mint, { ...entry, skippedAtMs: now() });
+}
+
+async function scanDeferredDryEntries() {
+  if (deferredDryEntries.size === 0) return;
+  for (const [mint, pending] of [...deferredDryEntries]) {
+    if (now() - pending.skippedAtMs > DEFERRED_DRY_TTL_MS) {
+      console.log(`[dry] deferred entry expired for ${pending.symbol} ${mint.slice(0, 8)}... (quote never recovered within ${DEFERRED_DRY_TTL_MS / 60000} min)`);
+      deferredDryEntries.delete(mint);
+      continue;
+    }
+    // Dedup: stop retrying if a dry position now exists on the mint.
+    const existing = db.prepare(`SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' AND (execution_mode IS NULL OR execution_mode = 'dry_run') LIMIT 1`).get(mint);
+    if (existing) { deferredDryEntries.delete(mint); continue; }
+    const qp = await fetchTokenSpotViaQuote(mint).catch(() => null);
+    if (!(Number.isFinite(qp) && qp > 0)) continue;
+    const asset = await fetchJupiterAsset(mint, { useCache: false });
+    const supply = Number(asset?.totalSupply || asset?.circSupply || 0);
+    const quoteMcap = supply > 0 ? qp * supply : null;
+    if (!quoteMcap || !Number.isFinite(quoteMcap) || quoteMcap <= 0) continue;
+    const corrected = {
+      ...pending.candidate,
+      metrics: { ...pending.candidate.metrics, priceUsd: qp, marketCapUsd: quoteMcap },
+      executionRefresh: { ...(pending.candidate.executionRefresh || {}), entryAnchor: 'quote', deferredTwin: true },
+    };
+    const result = await createDryRunPosition(pending.candidateId, corrected, pending.decision, `deferred_dry_${pending.batchId || mint.slice(0, 8)}`).catch((err) => {
+      console.log(`[dry] deferred entry failed for ${pending.symbol}: ${err.message}`);
+      return null;
+    });
+    if (result) {
+      if (result.isNew) {
+        console.log(`[dry] deferred entry #${result.id} opened for ${pending.symbol} ${mint.slice(0, 8)}... — quote anchor recovered, entry mcap ${quoteMcap.toFixed(0)}`);
+      }
+      deferredDryEntries.delete(mint); // created or dedup-blocked — stop retrying
+    }
+  }
+}
+
+// Deferred twin (2026-08-06, option 3): when the candidate-time quote anchor fails
+// (fail-closed: dry twin skipped rather than mark-anchored), backfill the twin at the
+// first per-tick quote that succeeds — the twin enters at the recovered executable quote
+// (honest "signal entry as soon as pricable"), no live-buy latency cost. Dedup is handled
+// by createDryRunPosition (returns isNew=false if a dry position already exists).
+async function maybeCreateDeferredTwin(position, prefetched) {
+  try {
+    const qp = prefetched?.qp;
+    const asset = prefetched?.asset;
+    if (!(Number.isFinite(qp) && qp > 0)) return;
+    const snap = typeof position.snapshot_json === 'string' ? JSON.parse(position.snapshot_json || '{}') : (position.snapshot_json || {});
+    const candidate = snap.candidate;
+    if (!candidate || !(candidate.signals?.route || '').includes('pumpportal_graduated')) return;
+    const supply = Number(asset?.totalSupply || asset?.circSupply || 0);
+    const quoteMcap = supply > 0 ? qp * supply : null;
+    if (!quoteMcap || !Number.isFinite(quoteMcap) || quoteMcap <= 0) return;
+    const corrected = {
+      ...candidate,
+      metrics: { ...candidate.metrics, priceUsd: qp, marketCapUsd: quoteMcap },
+      executionRefresh: { ...(candidate.executionRefresh || {}), entryAnchor: 'quote', deferredTwin: true },
+    };
+    const twin = await createDryRunPosition(position.candidate_id, corrected, snap.decision || {}, `shadow_twin_deferred_${position.id}`);
+    if (twin.isNew) {
+      console.log(`[shadow] deferred twin #${twin.id} opened for ${position.symbol} (live #${position.id}) — quote anchor recovered, entry mcap ${quoteMcap.toFixed(0)}`);
+    }
+  } catch (err) {
+    console.log(`[shadow] deferred twin failed for ${position.symbol}: ${err.message}`);
+  }
+}
+
 export async function monitorPositions() {
   const positions = openPositions();
   let walletPnlData = {};
@@ -436,5 +516,14 @@ export async function monitorPositions() {
       return null;
     });
     if (result?.exitReason) await sendPositionExit(result);
+    // Deferred twin backfill (2026-08-06): live positions that opened without a twin
+    // (candidate-time quote failed -> fail-closed skip) get their twin here once a
+    // per-tick quote succeeds. Only for still-open live positions; dedup is in
+    // createDryRunPosition. Skipped when the position closed this tick (result.exitReason).
+    else if (position.execution_mode === 'live') {
+      await maybeCreateDeferredTwin(position, prefetched);
+    }
   }
+  // Pure-dry deferred backfill: scan queued entries after the position loop.
+  await scanDeferredDryEntries();
 }

@@ -12,7 +12,7 @@ import { createDryRunPosition, createLivePosition, canOpenMorePositions, openPos
 import { sendBatchReveal, sendTelegram, sendPositionOpen, sendTradeIntent } from '../telegram/send.js';
 import { candidateSummary } from '../telegram/format.js';
 import { createTradeIntent } from '../db/intents.js';
-import { refreshCandidateForExecution } from '../execution/positions.js';
+import { refreshCandidateForExecution, queueDeferredDryEntry } from '../execution/positions.js';
 import { executeLiveBuy } from '../execution/router.js';
 import { graduated } from '../signals/graduated.js';
 import { setDegenHandler } from '../signals/trending.js';
@@ -321,7 +321,14 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
     // fiction (Bulls +107% phantom, BULLMOJI +284%, PEW +46%). Only fires on
     // pumpportal_graduated (entryAnchor is set only there); non-fresh routes keep the mark.
     if (freshSelectedRow.candidate.executionRefresh?.entryAnchor === 'mark') {
-      console.log(`[dry] entry SKIPPED for ${freshSelectedRow.candidate.token.symbol} ${freshSelectedRow.candidate.token.mint.slice(0, 8)}... — quote anchor unavailable after retries (stale-mark avoidance)`);
+      console.log(`[dry] entry DEFERRED for ${freshSelectedRow.candidate.token.symbol} ${freshSelectedRow.candidate.token.mint.slice(0, 8)}... — quote anchor unavailable after retries (stale-mark avoidance); will backfill on first successful quote`);
+      queueDeferredDryEntry(freshSelectedRow.candidate.token.mint, {
+        candidateId: freshSelectedRow.id,
+        candidate: freshSelectedRow.candidate,
+        decision,
+        symbol: freshSelectedRow.candidate.token.symbol,
+        batchId,
+      });
       logDecisionEvent({
         batchId,
         triggerCandidateId,
@@ -329,9 +336,9 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
         rows: executionRows,
         decision,
         mode,
-        action: 'dry_entry_skipped_no_quote',
+        action: 'dry_entry_deferred_no_quote',
         guardrails: { entryAnchor: 'mark', retries: 3 },
-        execution: { reason: 'quote anchor unavailable after retries (stale-mark avoidance)' },
+        execution: { reason: 'quote anchor unavailable after retries (stale-mark avoidance); will backfill on first successful quote' },
       });
       return;
     }
@@ -447,7 +454,7 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
   // live's FAILED_ENTRY semantics: no honest price -> no dry entry. Live still proceeds
   // (the E1 fill override records its true entry).
   if (freshSelectedRow.candidate.executionRefresh?.entryAnchor === 'mark') {
-    console.log(`[shadow] twin SKIPPED for ${freshSelectedRow.candidate.token.symbol} ${freshSelectedRow.candidate.token.mint.slice(0, 8)}... — quote anchor unavailable after retries (stale-mark avoidance); live entry continues`);
+    console.log(`[shadow] twin DEFERRED for ${freshSelectedRow.candidate.token.symbol} ${freshSelectedRow.candidate.token.mint.slice(0, 8)}... — quote anchor unavailable after retries (stale-mark avoidance); will backfill on first successful quote`);
   } else {
     try {
       const twin = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `shadow_twin_${batchId}`);
