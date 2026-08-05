@@ -4,6 +4,53 @@ import { generateDailyCard } from '../visuals/dailyCard.js';
 import { writeFileSync, unlinkSync } from 'fs';
 import Database from 'better-sqlite3';
 
+function computeStats(rows) {
+  const totalTrades = rows.length;
+  const wins = rows.filter(p => (p.pnl_sol || 0) > 0).length;
+  const losses = rows.filter(p => (p.pnl_sol || 0) <= 0).length;
+  const winRate = totalTrades > 0 ? (wins / totalTrades * 100) : 0;
+  const pnlSol = rows.reduce((sum, p) => sum + (p.pnl_sol || 0), 0);
+  const pnlPercent = totalTrades > 0
+    ? rows.reduce((sum, p) => sum + (p.pnl_percent || 0), 0) / totalTrades
+    : 0;
+
+  const sorted = [...rows].sort((a, b) => (b.pnl_percent || 0) - (a.pnl_percent || 0));
+  const bestTrade = totalTrades > 0
+    ? { pnlPercent: sorted[0].pnl_percent || 0, symbol: sorted[0].symbol || sorted[0].mint }
+    : null;
+  const worstTrade = totalTrades > 0
+    ? { pnlPercent: sorted[sorted.length - 1].pnl_percent || 0, symbol: sorted[sorted.length - 1].symbol || sorted[sorted.length - 1].mint }
+    : null;
+
+  const winTrades = rows.filter(p => (p.pnl_sol || 0) > 0);
+  const lossTrades = rows.filter(p => (p.pnl_sol || 0) <= 0);
+  const avgWin = winTrades.length > 0
+    ? winTrades.reduce((s, p) => s + (p.pnl_percent || 0), 0) / winTrades.length
+    : 0;
+  const avgLoss = lossTrades.length > 0
+    ? lossTrades.reduce((s, p) => s + (p.pnl_percent || 0), 0) / lossTrades.length
+    : 0;
+  const riskReward = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
+
+  return {
+    totalTrades,
+    wins,
+    losses,
+    winRate,
+    pnlSol,
+    pnlPercent,
+    bestTrade,
+    worstTrade,
+    avgWin,
+    avgLoss,
+    riskReward,
+    positions: rows.map(p => ({
+      pnlPercent: p.pnl_percent || 0,
+      symbol: p.symbol || '',
+    })),
+  };
+}
+
 export async function buildDailyReport() {
   const db = new Database(DB_PATH);
   try {
@@ -20,49 +67,16 @@ export async function buildDailyReport() {
       ORDER BY closed_at_ms DESC
     `).all(startWIBmidnight);
 
-    const totalTrades = closed.length;
-    const wins = closed.filter(p => (p.pnl_sol || 0) > 0).length;
-    const losses = closed.filter(p => (p.pnl_sol || 0) <= 0).length;
-    const winRate = totalTrades > 0 ? (wins / totalTrades * 100) : 0;
-    const pnlSol = closed.reduce((sum, p) => sum + (p.pnl_sol || 0), 0);
-    const pnlPercent = totalTrades > 0
-      ? closed.reduce((sum, p) => sum + (p.pnl_percent || 0), 0) / totalTrades
-      : 0;
-
-    const sorted = [...closed].sort((a, b) => (b.pnl_percent || 0) - (a.pnl_percent || 0));
-    const bestTrade = totalTrades > 0
-      ? { pnlPercent: sorted[0].pnl_percent || 0, symbol: sorted[0].symbol || sorted[0].mint }
-      : null;
-    const worstTrade = totalTrades > 0
-      ? { pnlPercent: sorted[sorted.length - 1].pnl_percent || 0, symbol: sorted[sorted.length - 1].symbol || sorted[sorted.length - 1].mint }
-      : null;
-
-    const winTrades = closed.filter(p => (p.pnl_sol || 0) > 0);
-    const lossTrades = closed.filter(p => (p.pnl_sol || 0) <= 0);
-    const avgWin = winTrades.length > 0
-      ? winTrades.reduce((s, p) => s + (p.pnl_percent || 0), 0) / winTrades.length
-      : 0;
-    const avgLoss = lossTrades.length > 0
-      ? lossTrades.reduce((s, p) => s + (p.pnl_percent || 0), 0) / lossTrades.length
-      : 0;
-    const riskReward = avgLoss !== 0 ? Math.abs(avgWin / avgLoss) : 0;
-
+    // 2026-08-05: split by track — live is the headline (real money), dry is the sim twin.
+    // COALESCE default 'dry_run' keeps pre-twin rows in the dry bucket. Top-level fields
+    // stay headline-compatible for the card renderer.
+    const live = computeStats(closed.filter(p => (p.execution_mode || 'dry_run') === 'live'));
+    const dry = computeStats(closed.filter(p => (p.execution_mode || 'dry_run') === 'dry_run'));
+    const headline = live.totalTrades > 0 ? live : dry;
     return {
-      totalTrades,
-      wins,
-      losses,
-      winRate,
-      pnlSol,
-      pnlPercent,
-      bestTrade,
-      worstTrade,
-      avgWin,
-      avgLoss,
-      riskReward,
-      positions: closed.map(p => ({
-        pnlPercent: p.pnl_percent || 0,
-        symbol: p.symbol || '',
-      })),
+      ...headline,
+      live,
+      dry,
       strategy: 'sniper',
     };
   } finally {
@@ -71,15 +85,24 @@ export async function buildDailyReport() {
 }
 
 export function buildReportCaption(report) {
+  const bucketLines = (label, r) => {
+    const lines = [
+      `${label}: ${r.totalTrades} (${r.wins}W / ${r.losses}L) \u00B7 WR: ${r.winRate.toFixed(1)}%`,
+      `PnL: ${r.pnlSol >= 0 ? '+' : ''}${r.pnlSol.toFixed(4)} SOL (avg ${r.pnlPercent >= 0 ? '+' : ''}${r.pnlPercent.toFixed(2)}%)`,
+    ];
+    if (r.bestTrade) lines.push(`Best: ${r.bestTrade.symbol} ${r.bestTrade.pnlPercent >= 0 ? '+' : ''}${r.bestTrade.pnlPercent.toFixed(2)}%`);
+    if (r.worstTrade) lines.push(`Worst: ${r.worstTrade.symbol} ${r.worstTrade.pnlPercent >= 0 ? '+' : ''}${r.worstTrade.pnlPercent.toFixed(2)}%`);
+    return lines;
+  };
+  const rr = report.live.bestTrade && report.live.worstTrade ? `RR: \u22481:${report.live.riskReward.toFixed(2)}` : '';
   return [
     `\u{1F4CA} <b>Daily Report</b>`,
     '',
-    `Trades: ${report.totalTrades} (${report.wins}W / ${report.losses}L) \u00B7 WR: ${report.winRate.toFixed(1)}%`,
-    `PnL: ${report.pnlSol >= 0 ? '+' : ''}${report.pnlSol.toFixed(4)} SOL (avg ${report.pnlPercent >= 0 ? '+' : ''}${report.pnlPercent.toFixed(2)}%)`,
-    report.bestTrade ? `Best: ${report.bestTrade.symbol} ${report.bestTrade.pnlPercent >= 0 ? '+' : ''}${report.bestTrade.pnlPercent.toFixed(2)}%` : '',
-    report.worstTrade ? `Worst: ${report.worstTrade.symbol} ${report.worstTrade.pnlPercent >= 0 ? '+' : ''}${report.worstTrade.pnlPercent.toFixed(2)}%` : '',
+    ...bucketLines('\u{1F7E2} Live (realized)', report.live),
     '',
-    report.bestTrade && report.worstTrade ? `RR: \u22481:${report.riskReward.toFixed(2)}` : '',
+    ...bucketLines('\u{1F535} Dry sim (mark-to-market)', report.dry),
+    '',
+    rr,
   ].filter(Boolean).join('\n');
 }
 

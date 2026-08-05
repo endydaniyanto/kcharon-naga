@@ -33,13 +33,19 @@ export async function refreshCandidateForExecution(row) {
   const route = candidate.signals?.route || '';
   const isFresh = route.includes('pumpportal_graduated');
 
-  let gmgn, asset, holders, chart;
+  let gmgn, asset, holders, chart, qp;
 
   if (isFresh) {
-    // Fast path: skip GMGN (Cloudflare blocked) and chart (no data for freshly graduated)
-    [asset, holders] = await Promise.all([
+    // Fast path: skip GMGN (Cloudflare blocked) and chart (no data for freshly graduated).
+    // Entry anchor (2026-08-05): also fetch the executable quote — the asset mark lags the
+    // migration reprice (BULLMOJI 3.65x / PEW 1.78x stale); the quote is what the bot can
+    // actually transact at and matched the fill in every observed case. Falls back to the
+    // mark when the quote fails (400/no-route on fresh grads — E2a class).
+    const qpPromise = fetchTokenSpotViaQuote(mint).catch(() => null);
+    [asset, holders, qp] = await Promise.all([
       fetchJupiterAsset(mint, { useCache: false }),
       fetchJupiterHolders(mint),
+      qpPromise,
     ]);
     gmgn = null;
     chart = null;
@@ -51,6 +57,7 @@ export async function refreshCandidateForExecution(row) {
     ]);
     chart = null;  // chart not used in buy path — saves 10s timeout
   }
+  const quotePrice = (Number.isFinite(qp) && qp > 0) ? qp : null;
   const selectedTrending = trending.get(mint) || candidate.trending || null;
   const selectedHolders = holders?.holders?.length ? holders : candidate.holders;
   const selectedSavedWalletExposure = selectedHolders
@@ -65,6 +72,23 @@ export async function refreshCandidateForExecution(row) {
     candidate.metrics?.marketCapUsd,
     candidate.metrics?.graduatedMarketCapUsd,
   );
+  // Entry anchor (2026-08-05): for fresh grads, prefer the executable-quote-derived
+  // price/mcap over the asset mark (stale right after migration). quoteMcap = quotePrice x supply.
+  let entryAnchorSrc = 'mark';
+  let effectivePriceUsd = priceUsd;
+  let effectiveMarketCapUsd = marketCapUsd;
+  if (isFresh && quotePrice != null) {
+    const supplyTokens = Number(asset?.totalSupply || asset?.circSupply || 0);
+    const quoteMcap = supplyTokens > 0 ? quotePrice * supplyTokens : null;
+    if (quoteMcap != null && Number.isFinite(quoteMcap) && quoteMcap > 0) {
+      entryAnchorSrc = 'quote';
+      effectivePriceUsd = quotePrice;
+      effectiveMarketCapUsd = quoteMcap;
+    }
+  }
+  if (isFresh) {
+    console.log(`[candidate] ${mint.slice(0, 8)}... entry anchor: ${entryAnchorSrc}${entryAnchorSrc === 'quote' ? ` (mcap ${effectiveMarketCapUsd.toFixed(0)}, mark was ${marketCapUsd.toFixed(0)})` : ' (quote unavailable — using mark)'}`);
+  }
   const refreshed = {
     ...candidate,
     token: {
@@ -77,8 +101,8 @@ export async function refreshCandidateForExecution(row) {
     },
     metrics: {
       ...candidate.metrics,
-      priceUsd,
-      marketCapUsd,
+      priceUsd: effectivePriceUsd,
+      marketCapUsd: effectiveMarketCapUsd,
       liquidityUsd: Number(gmgn?.liquidity ?? asset?.liquidity ?? selectedTrending?.liquidity ?? candidate.metrics?.liquidityUsd ?? 0),
       holderCount: Number(gmgn?.holder_count ?? asset?.holderCount ?? selectedTrending?.holder_count ?? candidate.metrics?.holderCount ?? 0),
       gmgnTotalFeesSol: Number(gmgn?.total_fee ?? asset?.fees ?? candidate.metrics?.gmgnTotalFeesSol ?? 0),
@@ -97,8 +121,9 @@ export async function refreshCandidateForExecution(row) {
     executionRefresh: {
       refreshedAtMs: now(),
       source: 'pre_execution',
-      marketCapUsd,
-      priceUsd,
+      entryAnchor: entryAnchorSrc,
+      marketCapUsd: effectiveMarketCapUsd,
+      priceUsd: effectivePriceUsd,
       liquidityUsd: Number(gmgn?.liquidity ?? asset?.liquidity ?? selectedTrending?.liquidity ?? 0),
       holdersRefreshed: Boolean(holders?.holders?.length),
     },
