@@ -124,17 +124,21 @@ export async function refreshCandidateForExecution(row) {
 
 const sellInProgress = new Set();
 
-export async function refreshPosition(position, { autoExit = true, jupiterPnl = null, forceExit = false } = {}) {
+export async function refreshPosition(position, { autoExit = true, jupiterPnl = null, forceExit = false, prefetched = null } = {}) {
   // Bug2 fix (2026-06-19): bypass 20s cache for live monitoring — flash crash detection requires fresh data
   // Quote-first (2026-07-24): exit decisions use executable Jupiter quote (live pool
   // reserves) as primary price — datapi mark is stale by design. Mark = fallback on 429/backoff.
   // E2b (2026-08-05): quote for BOTH dry and live so both legs decide on the same price
   // signal (shadow parity). The live fill still overrides reported PnL at close.
+  // Poll-parity (2026-08-05): when monitorPositions passes a prefetched per-mint price
+  // (twin pairs), use the SAME sample for both legs — identical high-water/trailing state.
   const useQuote = numSetting('exit_quote_enabled', 1);
-  const [asset, qp] = await Promise.all([
-    fetchJupiterAsset(position.mint, { useCache: false, ttlMs: 3000 }),
-    useQuote ? fetchTokenSpotViaQuote(position.mint) : Promise.resolve(null),
-  ]);
+  const [asset, qp] = prefetched
+    ? [prefetched.asset, prefetched.qp]
+    : await Promise.all([
+        fetchJupiterAsset(position.mint, { useCache: false, ttlMs: 3000 }),
+        useQuote ? fetchTokenSpotViaQuote(position.mint) : Promise.resolve(null),
+      ]);
   const quotePrice = (Number.isFinite(qp) && qp > 0) ? qp : null;
   const quoteMcap = quotePrice && Number(position.entry_price) > 0
     ? Number(position.entry_mcap) * (quotePrice / Number(position.entry_price))
@@ -369,11 +373,26 @@ export async function monitorPositions() {
   if (pubkey && positions.some(p => p.execution_mode === 'live')) {
     walletPnlData = await fetchJupiterWalletPnl(pubkey);
   }
+  // Poll-parity (2026-08-05): fetch price ONCE per mint per tick and share it across
+  // twin positions so dry/live accumulate identical high-water/trailing state. The
+  // 0.3-0.6s offset between per-position fetches made twin legs sample the same token
+  // at different instants (JELON: live hw 56.4K vs dry hw 54.5K → opposite trail calls).
+  const tickCache = new Map(); // mint -> { asset, qp }
   for (const position of positions) {
     const jupiterPnl = position.execution_mode === 'live'
       ? (walletPnlData[position.mint]?.pnl || null)
       : null;
-    const result = await refreshPosition(position, { autoExit: true, jupiterPnl }).catch((err) => {
+    let prefetched = tickCache.get(position.mint);
+    if (!prefetched) {
+      const useQuote = numSetting('exit_quote_enabled', 1);
+      const [asset, qp] = await Promise.all([
+        fetchJupiterAsset(position.mint, { useCache: false, ttlMs: 3000 }),
+        useQuote ? fetchTokenSpotViaQuote(position.mint) : Promise.resolve(null),
+      ]);
+      prefetched = { asset, qp };
+      tickCache.set(position.mint, prefetched);
+    }
+    const result = await refreshPosition(position, { autoExit: true, jupiterPnl, prefetched }).catch((err) => {
       console.log(`[position] ${position.id} ${err.message}`);
       return null;
     });
