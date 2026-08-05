@@ -126,9 +126,11 @@ const sellInProgress = new Set();
 
 export async function refreshPosition(position, { autoExit = true, jupiterPnl = null, forceExit = false } = {}) {
   // Bug2 fix (2026-06-19): bypass 20s cache for live monitoring — flash crash detection requires fresh data
-  // Quote-first (2026-07-24): dry_run exit decisions use executable Jupiter quote (live pool
+  // Quote-first (2026-07-24): exit decisions use executable Jupiter quote (live pool
   // reserves) as primary price — datapi mark is stale by design. Mark = fallback on 429/backoff.
-  const useQuote = position.execution_mode !== 'live' && numSetting('exit_quote_enabled', 1);
+  // E2b (2026-08-05): quote for BOTH dry and live so both legs decide on the same price
+  // signal (shadow parity). The live fill still overrides reported PnL at close.
+  const useQuote = numSetting('exit_quote_enabled', 1);
   const [asset, qp] = await Promise.all([
     fetchJupiterAsset(position.mint, { useCache: false, ttlMs: 3000 }),
     useQuote ? fetchTokenSpotViaQuote(position.mint) : Promise.resolve(null),
@@ -151,10 +153,13 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   let pnlPercent = (Number(mcap) / Number(position.entry_mcap) - 1) * 100;
   const markPnlPercent = pnlPercent;
   let pnlSol = Number(position.size_sol) * pnlPercent / 100;
-  if (jupiterPnl && Number.isFinite(Number(jupiterPnl.totalPnlPercentageNative))) {
-    pnlPercent = Number(jupiterPnl.totalPnlPercentageNative);
-    pnlSol = Number.isFinite(Number(jupiterPnl.totalPnlNative)) ? Number(jupiterPnl.totalPnlNative) : pnlSol;
-  }
+  // E2b (2026-08-05): jupiterPnl (Jupiter wallet-portfolio valuation) is REPORTING-ONLY.
+  // It must NOT override pnlPercent — exit decisions (TP/SL/trailing) run on the real
+  // price path (quote/mark) so dry and live legs are comparable. The live fill still
+  // overrides stored pnl at close. Kept only as a cross-check for logs/payload.
+  const jupiterPnlPercent = (jupiterPnl && Number.isFinite(Number(jupiterPnl.totalPnlPercentageNative)))
+    ? Number(jupiterPnl.totalPnlPercentageNative)
+    : null;
   // Dynamic ATR-based stop loss: fetch chart context and compute ATR% to widen/narrow the static sl_percent.
   const stratForSl = strategyById(position.strategy_id);
   const useDynamicSl = (stratForSl?.use_dynamic_sl ?? numSetting('use_dynamic_sl', 1)) ? true : false;
@@ -274,7 +279,7 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   // logs (KAKAO 08-05: -20% SL fired at -92.5%, undiagnosable from logs).
   if (autoExit) {
     const srcLabel = quotePrice != null ? 'quote' : (jupiterPrice > 0 ? 'mark' : 'fallback');
-    console.log(`[position] #${position.id} ${position.symbol} ${position.execution_mode || 'dry_run'} tick price=${price} mcap=${mcap} pnl=${pnlPercent.toFixed(2)}% src=${srcLabel} sl=${effectiveSlPercent}% tp=${position.tp_percent}% exit=${exitReason || '-'}`);
+    console.log(`[position] #${position.id} ${position.symbol} ${position.execution_mode || 'dry_run'} tick price=${price} mcap=${mcap} pnl=${pnlPercent.toFixed(2)}% src=${srcLabel} sl=${effectiveSlPercent}% tp=${position.tp_percent}% exit=${exitReason || '-'} jpnl=${jupiterPnlPercent != null ? jupiterPnlPercent.toFixed(2) + '%' : '-'}`);
   }
 
   // Live exits will override these with realized SOL values
