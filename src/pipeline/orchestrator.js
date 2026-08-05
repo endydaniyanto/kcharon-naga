@@ -315,6 +315,26 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
   if (mode === 'dry_run') {
     // FIX #3: Wrap position creation in try-catch to capture execution failures
     let positionId, isNew, pastWinPnlSol, pastWinClosedAtMs;
+    // No-stale-mark guard (2026-08-06): fail-closed for fresh-grad dry entries when the
+    // executable-quote anchor is unavailable after retries (entryAnchor=mark) — mirrors
+    // live's FAILED_ENTRY semantics. A mark-anchored fresh-grad dry entry is stale-mark
+    // fiction (Bulls +107% phantom, BULLMOJI +284%, PEW +46%). Only fires on
+    // pumpportal_graduated (entryAnchor is set only there); non-fresh routes keep the mark.
+    if (freshSelectedRow.candidate.executionRefresh?.entryAnchor === 'mark') {
+      console.log(`[dry] entry SKIPPED for ${freshSelectedRow.candidate.token.symbol} ${freshSelectedRow.candidate.token.mint.slice(0, 8)}... — quote anchor unavailable after retries (stale-mark avoidance)`);
+      logDecisionEvent({
+        batchId,
+        triggerCandidateId,
+        selectedRow: freshSelectedRow,
+        rows: executionRows,
+        decision,
+        mode,
+        action: 'dry_entry_skipped_no_quote',
+        guardrails: { entryAnchor: 'mark', retries: 3 },
+        execution: { reason: 'quote anchor unavailable after retries (stale-mark avoidance)' },
+      });
+      return;
+    }
     try {
       const result = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `llm_batch_${batchId}`);
       positionId = result.id;
@@ -421,13 +441,22 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
   // Shadow twin (2026-08-05): in live mode, pumpportal_graduated also opens a dry-run
   // twin so live and dry outcomes can be compared. Twin is created FIRST so it stands
   // even if the live swap fails (pure counterfactual). Twin failures never block live.
-  try {
-    const twin = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `shadow_twin_${batchId}`);
-    if (twin.isNew) {
-      console.log(`[shadow] dry twin #${twin.id} opened for ${freshSelectedRow.candidate.token.symbol} — live execution pending`);
+  // No-stale-mark guard (2026-08-06): the twin is SKIPPED when the executable-quote
+  // anchor is unavailable (entryAnchor=mark after 3 retries) — a mark-anchored dry entry
+  // is stale-mark fiction (Bulls +107% phantom, BULLMOJI +284%, PEW +46%). This mirrors
+  // live's FAILED_ENTRY semantics: no honest price -> no dry entry. Live still proceeds
+  // (the E1 fill override records its true entry).
+  if (freshSelectedRow.candidate.executionRefresh?.entryAnchor === 'mark') {
+    console.log(`[shadow] twin SKIPPED for ${freshSelectedRow.candidate.token.symbol} ${freshSelectedRow.candidate.token.mint.slice(0, 8)}... — quote anchor unavailable after retries (stale-mark avoidance); live entry continues`);
+  } else {
+    try {
+      const twin = await createDryRunPosition(freshSelectedRow.id, freshSelectedRow.candidate, decision, `shadow_twin_${batchId}`);
+      if (twin.isNew) {
+        console.log(`[shadow] dry twin #${twin.id} opened for ${freshSelectedRow.candidate.token.symbol} — live execution pending`);
+      }
+    } catch (twinErr) {
+      console.error(`[shadow] dry twin failed for ${freshSelectedRow.candidate.token.symbol}: ${twinErr.message}`);
     }
-  } catch (twinErr) {
-    console.error(`[shadow] dry twin failed for ${freshSelectedRow.candidate.token.symbol}: ${twinErr.message}`);
   }
 
   try {

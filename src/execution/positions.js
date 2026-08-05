@@ -41,12 +41,19 @@ export async function refreshCandidateForExecution(row) {
     // migration reprice (BULLMOJI 3.65x / PEW 1.78x stale); the quote is what the bot can
     // actually transact at and matched the fill in every observed case. Falls back to the
     // mark when the quote fails (400/no-route on fresh grads — E2a class).
-    const qpPromise = fetchTokenSpotViaQuote(mint).catch(() => null);
-    [asset, holders, qp] = await Promise.all([
-      fetchJupiterAsset(mint, { useCache: false }),
-      fetchJupiterHolders(mint),
-      qpPromise,
-    ]);
+    // Quote retry (2026-08-06): fresh-grad routes often 400/no-route for a beat before the
+    // lite-api can route them — retry 3x/750ms so the dry twin gets the quote anchor instead
+    // of the stale mark (Bulls 08-05: single attempt failed -> entryAnchor=mark -> dry +107% phantom).
+    const assetP = fetchJupiterAsset(mint, { useCache: false });
+    const holdersP = fetchJupiterHolders(mint);
+    qp = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      qp = await fetchTokenSpotViaQuote(mint).catch(() => null);
+      if (Number.isFinite(qp) && qp > 0) break;
+      console.log(`[candidate] quote attempt ${attempt}/3 failed for ${mint.slice(0, 8)}...`);
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 750));
+    }
+    [asset, holders] = await Promise.all([assetP, holdersP]);
     gmgn = null;
     chart = null;
   } else {
@@ -87,7 +94,7 @@ export async function refreshCandidateForExecution(row) {
     }
   }
   if (isFresh) {
-    console.log(`[candidate] ${mint.slice(0, 8)}... entry anchor: ${entryAnchorSrc}${entryAnchorSrc === 'quote' ? ` (mcap ${effectiveMarketCapUsd.toFixed(0)}, mark was ${marketCapUsd.toFixed(0)})` : ' (quote unavailable — using mark)'}`);
+    console.log(`[candidate] ${mint.slice(0, 8)}... entry anchor: ${entryAnchorSrc}${entryAnchorSrc === 'quote' ? ` (mcap ${effectiveMarketCapUsd.toFixed(0)}, mark was ${marketCapUsd.toFixed(0)})` : ' (quote unavailable after retries — live pre-fill uses mark, dry twin will be SKIPPED)'}`);
   }
   const refreshed = {
     ...candidate,
