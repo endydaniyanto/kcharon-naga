@@ -288,6 +288,7 @@ export {
   normalizeJupiterTrendingRow,
   fetchJupiterAsset,
   fetchSolUsdPrice,
+  fetchSolUsdPriceCached,
   estimateTokenAmountFromSol,
   fetchJupiterHolders,
   summarizeCandles,
