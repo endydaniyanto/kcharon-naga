@@ -199,6 +199,7 @@ export async function closePosition(chatId, id, reason) {
     INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
     VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?)
   `).run(id, row.mint, now(), price, mcap, row.size_sol, row.token_amount_est, reason, json({ pnlPercent, pnlSol, sell }));
+  console.log(`[position] #${id} ${row.symbol} ${row.execution_mode || 'dry_run'} MANUAL CLOSE reason=${reason} pnl=${pnlPercent.toFixed(2)}% pnlSol=${pnlSol.toFixed(4)} price=${price} mcap=${mcap} sig=${sell?.signature || '-'}`);
   const label = row.execution_mode === 'live' ? 'Closed live position' : 'Closed dry-run position';
   await bot.sendMessage(chatId, `${label} #${id}: ${escapeHtml(reason)} ${fmtPct(pnlPercent)}`, { parse_mode: 'HTML' });
 }

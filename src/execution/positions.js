@@ -269,6 +269,13 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   // dry = marked-to-market PnL), so the audit trail stays consistent.
   if (forceExit) exitReason = 'FLUSH';
 
+  // Tick observability (2026-08-05): log the exact price source + exit decision each poll.
+  // Needed because silent quote-null paths left the dry engine on a stale mark with zero
+  // logs (KAKAO 08-05: -20% SL fired at -92.5%, undiagnosable from logs).
+  if (autoExit) {
+    const srcLabel = quotePrice != null ? 'quote' : (jupiterPrice > 0 ? 'mark' : 'fallback');
+    console.log(`[position] #${position.id} ${position.symbol} ${position.execution_mode || 'dry_run'} tick price=${price} mcap=${mcap} pnl=${pnlPercent.toFixed(2)}% src=${srcLabel} sl=${effectiveSlPercent}% tp=${position.tp_percent}% exit=${exitReason || '-'}`);
+  }
 
   // Live exits will override these with realized SOL values
   let finalPnlPercent = pnlPercent;
@@ -325,6 +332,9 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
     finalPnlPercent = dryPnlPercent;
     finalPnlSol = dryPnlSol;
     closed = true;
+  }
+  if (closed) {
+    console.log(`[position] #${position.id} ${position.symbol} ${position.execution_mode || 'dry_run'} EXIT reason=${exitReason} pnl=${finalPnlPercent?.toFixed(2)}% pnlSol=${finalPnlSol?.toFixed(4)} price=${price} mcap=${mcap}`);
   }
   return {
     ...position,

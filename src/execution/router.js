@@ -81,9 +81,11 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
       `Error: ${escapeHtml(lastError?.message || 'unknown')}`,
       `Position #${positionId} recorded as FAILED_ENTRY.`,
     ].join('\n'));
+    console.log(`[executeLiveBuy] FAILED_ENTRY ${candidate.token.symbol} ${candidate.token.mint.slice(0, 8)}... after ${ENTRY_MAX_ATTEMPTS} attempts: ${lastError?.message || 'unknown'}`);
     throw lastError || new Error('Live buy failed without exception');
   }
   const { id: positionId, isNew } = createLivePosition(selectedRow.id, candidate, decision, swap, `live_batch_${batchId}`);
+  console.log(`[executeLiveBuy] ok #${positionId} ${candidate.token.symbol} ${candidate.token.mint.slice(0, 8)}... size=${amountLamports / 1_000_000_000} SOL sig=${swap.signature || '-'} isNew=${isNew}`);
   logDecisionEvent({
     batchId,
     triggerCandidateId,

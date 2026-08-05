@@ -232,7 +232,11 @@ async function fetchSolUsdPriceCached() {
 // Fixed 1000-token reference amount ignores price impact for large sizes —
 // upgrade to position-sized quotes when size_sol > 1.
 async function fetchTokenSpotViaQuote(mint) {
-  if (quoteBackoffActive()) return null;
+  const tag = mint.slice(0, 8);
+  if (quoteBackoffActive()) {
+    console.log(`[quote] ${tag}... backoff active until ${new Date(quoteBackoffUntil).toISOString()} — skipped (exit will use mark)`);
+    return null;
+  }
   try {
     const url = new URL('https://lite-api.jup.ag/swap/v1/quote');
     url.searchParams.set('inputMint', mint);
@@ -244,13 +248,22 @@ async function fetchTokenSpotViaQuote(mint) {
       axios.get(url.toString(), { timeout: 10_000, headers: JSON_HEADERS }),
     ]);
     const outAmount = quoteRes.data?.outAmount;
-    if (!outAmount) return null;
+    if (!outAmount) {
+      console.log(`[quote] ${tag}... no route (outAmount null) — exit will fall back to mark`);
+      return null;
+    }
     const outSol = Number(outAmount) / 1e9;
-    if (!Number.isFinite(solUsd) || solUsd <= 0) return null;
-    return (outSol / 1000) * solUsd;
+    if (!Number.isFinite(solUsd) || solUsd <= 0) {
+      console.log(`[quote] ${tag}... invalid solUsd (${solUsd}) — exit will fall back to mark`);
+      return null;
+    }
+    const price = (outSol / 1000) * solUsd;
+    console.log(`[quote] ${tag}... ok price=${price} (outAmount=${outAmount})`);
+    return price;
   } catch (err) {
     setQuoteBackoff(err);
-    if (err.response?.status !== 429) console.log(`[quote] ${mint.slice(0, 8)}... ${err.response?.status || ''} ${err.message}`);
+    if (err.response?.status !== 429) console.log(`[quote] ${tag}... ${err.response?.status || ''} ${err.message}`);
+    else console.log(`[quote] ${tag}... 429 rate-limited`);
     return null;
   }
 }
