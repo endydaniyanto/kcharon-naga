@@ -1,7 +1,7 @@
 import { now, json } from '../utils.js';
 import { numSetting, boolSetting } from '../db/settings.js';
 import { db } from '../db/connection.js';
-import { WSOL_MINT, LIVE_MIN_SOL_RESERVE_LAMPORTS } from '../config.js';
+import { WSOL_MINT, LIVE_MIN_SOL_RESERVE_LAMPORTS, JUPITER_SLIPPAGE_BPS } from '../config.js';
 import { escapeHtml, fmtSol } from '../format.js';
 import { executeJupiterSwap, liveWalletBalanceLamports, fetchLiveTokenBalance } from '../liveExecutor.js';
 import { fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
@@ -17,6 +17,7 @@ import { updateCandidateStatus } from '../db/candidates.js';
 import { createTradeIntent } from '../db/intents.js';
 
 const ENTRY_MAX_ATTEMPTS = 3;
+const SELL_MAX_ATTEMPTS = 3;
 
 export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
   const strat = activeStrategy();
@@ -133,11 +134,29 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
 export async function executeLiveSell(position, reason) {
   const amount = position.token_amount_raw || position.token_amount_est;
   if (!amount || Number(amount) <= 0) throw new Error('Live position has no token amount to sell.');
-  return executeJupiterSwap({
-    inputMint: position.mint,
-    outputMint: WSOL_MINT,
-    amount,
-  });
+  // E4 (2026-08-05): sells retry like entries (transient failures: RPC, 429, execute timeout)
+  // and send JUPITER_SLIPPAGE_BPS (default 300 = 3%). Previously the live path sent NO slippage
+  // param — Jupiter's default was too tight for panic sells (Munchkin 08-05: SL sell failed
+  // "Slippage tolerance exceeded" at -27%, position rode the crash to -79.4% before the next
+  // poll re-triggered SL). Callers: auto-exit, partial TP, manual close — all inherit this.
+  let lastError = null;
+  for (let attempt = 1; attempt <= SELL_MAX_ATTEMPTS; attempt++) {
+    try {
+      const swap = await executeJupiterSwap({
+        inputMint: position.mint,
+        outputMint: WSOL_MINT,
+        amount,
+        slippageBps: JUPITER_SLIPPAGE_BPS,
+      });
+      if (attempt > 1) console.log(`[sell] ok on attempt ${attempt}/${SELL_MAX_ATTEMPTS} ${position.symbol} sig=${(swap.signature || '-').slice(0, 10)}`);
+      return swap;
+    } catch (err) {
+      lastError = err;
+      console.log(`[sell] attempt ${attempt}/${SELL_MAX_ATTEMPTS} failed for ${position.symbol}: ${err.message}`);
+      if (attempt < SELL_MAX_ATTEMPTS) await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  throw lastError || new Error('Live sell failed without exception');
 }
 
 export async function executeConfirmedIntent(chatId, intentId) {

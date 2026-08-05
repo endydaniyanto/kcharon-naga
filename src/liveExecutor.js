@@ -62,12 +62,15 @@ export async function liveWalletBalanceLamports() {
   return solanaConnection.getBalance(liveWallet.publicKey, 'confirmed');
 }
 
-async function jupiterOrder({ inputMint, outputMint, amount }) {
+async function jupiterOrder({ inputMint, outputMint, amount, slippageBps = null }) {
   requireLiveExecution();
   const url = new URL(`${JUPITER_SWAP_BASE_URL.replace(/\/$/, '')}/order`);
   url.searchParams.set('inputMint', inputMint);
   url.searchParams.set('outputMint', outputMint);
   url.searchParams.set('amount', String(amount));
+  // E4 (2026-08-05): wire slippage through — live orders previously sent NO slippageBps
+  // (ran at Jupiter's server default, too tight for panic sells on a crashing micro-cap).
+  if (slippageBps != null) url.searchParams.set('slippageBps', String(slippageBps));
   url.searchParams.set('taker', liveWallet.publicKey.toBase58());
   const res = await axios.get(url.toString(), {
     timeout: 20_000,
@@ -103,8 +106,8 @@ async function jupiterExecute(order, signedTransaction) {
   return res.data;
 }
 
-export async function executeJupiterSwap({ inputMint, outputMint, amount }) {
-  const order = await jupiterOrder({ inputMint, outputMint, amount });
+export async function executeJupiterSwap({ inputMint, outputMint, amount, slippageBps = null }) {
+  const order = await jupiterOrder({ inputMint, outputMint, amount, slippageBps });
   const transaction = orderTransactionBase64(order);
   if (!transaction) throw new Error('Jupiter order did not include a transaction.');
   const signedTransaction = signTransactionBase64(transaction);
