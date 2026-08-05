@@ -146,8 +146,8 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   const jupiterPrice = Number(asset?.usdPrice);
   const jupiterMcap = firstPositiveNumber(asset?.mcap, asset?.fdv);
   // Guard 1 DISABLED (2026-07-17): can't distinguish crash vs stale data — single source (Jupiter) is unreliable
-  const price = firstPositiveNumber(quotePrice, jupiterPrice || null, position.high_water_price, position.entry_price);
-  const mcap = firstPositiveNumber(quoteMcap, jupiterMcap, position.high_water_mcap, position.entry_mcap);
+  let price = firstPositiveNumber(quotePrice, jupiterPrice || null, position.high_water_price, position.entry_price);
+  let mcap = firstPositiveNumber(quoteMcap, jupiterMcap, position.high_water_mcap, position.entry_mcap);
   if (!Number.isFinite(Number(mcap)) || !Number.isFinite(Number(position.entry_mcap)) || Number(position.entry_mcap) <= 0) {
     return null;
   }
@@ -310,6 +310,13 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
     if (receivedSol != null) {
       finalPnlSol = receivedSol - Number(position.size_sol);
       finalPnlPercent = (receivedSol / Number(position.size_sol) - 1) * 100;
+    }
+    // E1 (2026-08-05): record the realized-equivalent exit price/mcap so the row is
+    // internally consistent with the realized PnL (previously the stored mark could be
+    // far off: CATEAI exit_mcap +30.9% with realized -95.6%). Mark stays in trade payload.
+    if (receivedSol != null && Number.isFinite(Number(finalPnlPercent))) {
+      if (Number(position.entry_mcap) > 0) mcap = Number(position.entry_mcap) * (1 + Number(finalPnlPercent) / 100);
+      if (Number(position.entry_price) > 0) price = Number(position.entry_price) * (1 + Number(finalPnlPercent) / 100);
     }
     db.prepare(`
       UPDATE dry_run_positions

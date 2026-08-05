@@ -4,6 +4,7 @@ import { db } from '../db/connection.js';
 import { WSOL_MINT, LIVE_MIN_SOL_RESERVE_LAMPORTS } from '../config.js';
 import { escapeHtml, fmtSol } from '../format.js';
 import { executeJupiterSwap, liveWalletBalanceLamports, fetchLiveTokenBalance } from '../liveExecutor.js';
+import { fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
 import { activeStrategy } from '../db/settings.js';
 import { createLivePosition, canOpenMorePositions, openPositionCount } from '../db/positions.js';
 import { intentById } from '../db/intents.js';
@@ -84,7 +85,36 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
     console.log(`[executeLiveBuy] FAILED_ENTRY ${candidate.token.symbol} ${candidate.token.mint.slice(0, 8)}... after ${ENTRY_MAX_ATTEMPTS} attempts: ${lastError?.message || 'unknown'}`);
     throw lastError || new Error('Live buy failed without exception');
   }
-  const { id: positionId, isNew } = createLivePosition(selectedRow.id, candidate, decision, swap, `live_batch_${batchId}`);
+  // E1 (2026-08-05): record the ACTUAL fill-derived entry price/mcap when derivable.
+  // swap.outputAmount = raw tokens received; decimals from the execution-refreshed
+  // candidate's Jupiter asset. Guards: valid decimals, positive SOL/USD, and a sanity
+  // band vs the mark (a >50% deviation almost certainly means a decimals/supply
+  // mismatch, not a real fill — keep the mark in that case).
+  let entryOverrides = null;
+  try {
+    const decimals = Number(candidate.jupiterAsset?.decimals);
+    const rawTokens = Number(swap.outputAmount || 0);
+    const markPrice = Number(candidate.metrics?.priceUsd || 0);
+    const markMcap = Number(candidate.metrics?.marketCapUsd || candidate.metrics?.graduatedMarketCapUsd || 0);
+    if (rawTokens > 0 && Number.isFinite(decimals) && decimals > 0 && markPrice > 0 && markMcap > 0) {
+      const tokenCount = rawTokens / Math.pow(10, decimals);
+      const solUsd = await fetchSolUsdPriceCached();
+      if (Number.isFinite(solUsd) && solUsd > 0 && tokenCount > 0) {
+        const fillPriceUsd = (amountLamports / 1_000_000_000) / tokenCount * solUsd;
+        const fillMcap = fillPriceUsd * (markMcap / markPrice);
+        if (Number.isFinite(fillPriceUsd) && fillPriceUsd > 0 && Number.isFinite(fillMcap) && fillMcap > 0
+            && Math.abs(fillPriceUsd / markPrice - 1) <= 0.5) {
+          entryOverrides = { entryPrice: fillPriceUsd, entryMcap: fillMcap };
+          console.log(`[executeLiveBuy] entry fill override: mark ${markPrice.toFixed(8)} -> fill ${fillPriceUsd.toFixed(8)} (mcap ${markMcap.toFixed(0)} -> ${fillMcap.toFixed(0)})`);
+        } else {
+          console.log(`[executeLiveBuy] entry fill override SKIPPED (outside sanity band): fill/mark=${(fillPriceUsd / markPrice).toFixed(3)}`);
+        }
+      }
+    }
+  } catch (err) {
+    console.log(`[executeLiveBuy] entry fill override failed (keeping mark): ${err.message}`);
+  }
+  const { id: positionId, isNew } = createLivePosition(selectedRow.id, candidate, decision, swap, `live_batch_${batchId}`, entryOverrides);
   console.log(`[executeLiveBuy] ok #${positionId} ${candidate.token.symbol} ${candidate.token.mint.slice(0, 8)}... size=${amountLamports / 1_000_000_000} SOL sig=${swap.signature || '-'} isNew=${isNew}`);
   logDecisionEvent({
     batchId,

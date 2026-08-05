@@ -145,11 +145,14 @@ export function createDryRunPosition(candidateId, candidate, decision, reason = 
   })();
 }
 
-export function createLivePosition(candidateId, candidate, decision, swap, reason = 'live_buy') {
+export function createLivePosition(candidateId, candidate, decision, swap, reason = 'live_buy', entryOverrides = null) {
   const strat = activeStrategy();
   const sizeSol = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
-  const entryPrice = Number(candidate.metrics.priceUsd || 0) || null;
-  const entryMcap = Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null;
+  // E1 (2026-08-05): entryOverrides carry the actual fill-derived entry price/mcap
+  // (computed in executeLiveBuy from swap.outputAmount + token decimals); falls back
+  // to the candidate mark when unavailable.
+  const entryPrice = entryOverrides?.entryPrice ?? (Number(candidate.metrics.priceUsd || 0) || null);
+  const entryMcap = entryOverrides?.entryMcap ?? (Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null);
   const tp = Number(decision.suggested_tp_percent || strat.tp_percent || numSetting('default_tp_percent', 50));
   const sl = Number(decision.suggested_sl_percent || strat.sl_percent || numSetting('default_sl_percent', -25));
   const trailingEnabled = (strat.trailing_enabled ?? boolSetting('default_trailing_enabled', true)) ? 1 : 0;
