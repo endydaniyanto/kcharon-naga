@@ -80,6 +80,11 @@ async function jupiterOrder({ inputMint, outputMint, amount, slippageBps = null 
   if (order.errorCode || order.error) {
     throw new Error(`Jupiter order failed: ${order.errorMessage || order.error || order.errorCode}`);
   }
+  // RTSE observability (2026-08-06): mode=ultra means RTSE adaptive slippage is active
+  // (slippageBps is the RTSE-chosen value); mode=manual means an override was applied.
+  if (order.mode) {
+    console.log(`[order] ${inputMint.slice(0, 8)}...->${outputMint.slice(0, 8)}... mode=${order.mode} slippageBps=${order.slippageBps ?? 'rtse'} outAmount=${order.outAmount ?? '-'} router=${order.router ?? '-'}`);
+  }
   return order;
 }
 

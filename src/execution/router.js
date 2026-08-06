@@ -148,6 +148,11 @@ export async function executeLiveSell(position, reason) {
   // param — Jupiter's default was too tight for panic sells (Munchkin 08-05: SL sell failed
   // "Slippage tolerance exceeded" at -27%, position rode the crash to -79.4% before the next
   // poll re-triggered SL). Callers: auto-exit, partial TP, manual close — all inherit this.
+  // RTSE (2026-08-06): JUPITER_SLIPPAGE_BPS=0 (env) now means RTSE — pass null so /order
+  // runs in ultra mode with Jupiter's adaptive slippage (docs: RTSE automatic on /order,
+  // any slippageBps override flips to manual mode). >0 keeps the fixed override as the
+  // panic-exit safety knob. The 3x retry re-quotes each attempt, so RTSE re-estimates at
+  // the current price on retries — adaptive widening during a crash.
   let lastError = null;
   for (let attempt = 1; attempt <= SELL_MAX_ATTEMPTS; attempt++) {
     try {
@@ -155,7 +160,7 @@ export async function executeLiveSell(position, reason) {
         inputMint: position.mint,
         outputMint: WSOL_MINT,
         amount,
-        slippageBps: JUPITER_SLIPPAGE_BPS,
+        slippageBps: JUPITER_SLIPPAGE_BPS > 0 ? JUPITER_SLIPPAGE_BPS : null,
       });
       if (attempt > 1) console.log(`[sell] ok on attempt ${attempt}/${SELL_MAX_ATTEMPTS} ${position.symbol} sig=${(swap.signature || '-').slice(0, 10)}`);
       return swap;
