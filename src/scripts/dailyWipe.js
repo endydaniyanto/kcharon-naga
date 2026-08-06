@@ -1,13 +1,16 @@
-// Daily maintenance: wipe candidates + llm_decisions at 00:00 UTC.
-// Policy: keep screening/LLM data for 24h, delete on the new day. No snapshots.
+// Daily maintenance: wipe candidates + llm_decisions + signal_events at 00:00 UTC.
+// Policy: keep screening/LLM/signal data for 24h, delete on the new day. No snapshots.
 // P&L history (dry_run_positions/trades) and decision_logs are untouched —
 // the win-block guard (7d) and re-buy block (72h) read positions, not candidates.
+// signal_events is write-only audit (verified 2026-08-06: only DDL + commented-out
+// trenches JOIN + dead dailySignalCount() read it); traded-token enrichment is
+// durably carried by dry_run_positions.snapshot_json (100% coverage incl. live rows).
 // Runs in-process via scheduleDailyWipe() from app.js — the volume is only
 // reachable from inside the kcharon-naga container.
 import Database from 'better-sqlite3';
 import { DB_PATH } from '../config.js';
 
-const WIPE_TABLES = ['candidates', 'llm_decisions'];
+const WIPE_TABLES = ['candidates', 'llm_decisions', 'signal_events'];
 
 function dbSizeBytes(db) {
   return db.pragma('page_count', { simple: true }) * db.pragma('page_size', { simple: true });
