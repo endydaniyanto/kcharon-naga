@@ -118,7 +118,10 @@ def extract_features(candidate):
     f["rug_ratio"] = safe_float(trenches.get("rug_ratio"))
     f["fresh_wallet_rate"] = safe_float(trenches.get("fresh_wallet_rate"))
     
-    chart = gmgn.get("chart") or {}
+    # Gap B (2026-08-07): the author's pipeline stored chart under gmgn; ours stores
+    # it top-level on the candidate (fetchJupiterChartContext). Fall back to
+    # candidate.chart so below_ath/ath_change/swing_change actually populate.
+    chart = gmgn.get("chart") or candidate.get("chart") or {}
     if not isinstance(chart, dict):
         chart = {}
     f["below_ath_pct"] = safe_float(chart.get("belowHighPercent") or chart.get("distanceFromAthPercent"))

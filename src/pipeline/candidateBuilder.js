@@ -499,14 +499,20 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
 
   if (isFreshlyGraduated) {
     console.log(`[candidate] fast path for freshly graduated ${mint.slice(0, 8)}...`);
-    const [jupAsset, jupHolders] = await Promise.all([
+    // Gap A (2026-08-07): fetch gmgn + chart on the fast path too, so the momentum
+    // model gets its 41 features (gmgn.price nested object, wallet_tags_stat, chart).
+    // Both fetchers are fail-open: gmgn → null on backoff/error, chart → per-window
+    // error rows. Worst case = old behavior (nulls), not a candidate failure.
+    const [gmgnInfo, jupAsset, jupHolders, jupChart] = await Promise.all([
+      fetchGmgnTokenInfo(mint),
       fetchJupiterAsset(mint),
       fetchJupiterHolders(mint),
+      fetchJupiterChartContext(mint),
     ]);
     jupiterAsset = jupAsset;
     holders = jupHolders;
-    gmgn = null;
-    chart = null;
+    gmgn = gmgnInfo;
+    chart = jupChart;
     twitterNarrative = null;
     savedWalletExposure = await fetchSavedWalletExposure(mint, holders);
   } else {
