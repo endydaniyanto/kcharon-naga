@@ -143,6 +143,18 @@ export async function refreshCandidateForExecution(row) {
     },
   };
   refreshed.filters = filterCandidate(refreshed);
+  // Preserve reporting-only momentum fields: filterCandidate rebuilds filters from
+  // scratch and would drop momentumScore/momentumReason/momentumLatencyMs set in the
+  // orchestrator before the buy path. Without this the refresh re-writes the DB row
+  // (updateCandidateSnapshot below) WITHOUT the score — verified live: DYCRLTNB
+  // position 2663 had no momentumScore in snapshot_json despite the orchestrator
+  // re-persist (06:10:24.867 update was the refresh clobbering it).
+  const origFilters = candidate.filters || {};
+  if (origFilters.momentumScore !== undefined) {
+    refreshed.filters.momentumScore = origFilters.momentumScore;
+    refreshed.filters.momentumReason = origFilters.momentumReason;
+    refreshed.filters.momentumLatencyMs = origFilters.momentumLatencyMs;
+  }
   const executionFailures = [];
   if (!Number.isFinite(Number(refreshed.metrics.marketCapUsd)) || Number(refreshed.metrics.marketCapUsd) <= 0) {
     executionFailures.push('execution mcap: missing');
