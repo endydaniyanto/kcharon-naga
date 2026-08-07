@@ -1,5 +1,6 @@
 {
   "$schema": "https://schema.railpack.com",
+  "buildAptPackages": ["python3-pip"],
   "steps": {
     "python-deps": {
       "commands": [
