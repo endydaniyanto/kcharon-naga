@@ -5,7 +5,7 @@
       "commands": [
         "python3 -m pip install --quiet --no-cache-dir --target /app/pylib numpy scikit-learn==1.9.0"
       ],
-      "deployOutputs": ["pylib"]
+      "deployOutputs": [{ "include": ["pylib"] }]
     }
   },
   "deploy": {
