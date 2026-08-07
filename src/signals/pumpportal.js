@@ -177,10 +177,18 @@ async function handleNewToken(data) {
   });
 }
 
-function buildGraduatedCoin(mint, symbol, gmgnInfo, originalData, patternFlags = []) {
+function buildGraduatedCoin(mint, symbol, gmgnInfo, originalData, patternFlags = [], serverVolume = null) {
   const marketCap = Number(gmgnInfo?.market_cap ?? gmgnInfo?.mcap ?? 0) || null;
   const holderCount = Number(gmgnInfo?.holder_count ?? 0) || null;
   const liquidity = Number(gmgnInfo?.liquidity ?? 0) || null;
+  // Gap E (2026-08-07): graduated volume was never set on the pumpportal path, so
+  // metrics.graduatedVolumeUsd (momentum feature graduated_volume) stayed 0. The
+  // author's signal-server graduatedCoin carried volume24h (serverClient.js:65).
+  // Priority: server volume24h (author's source, if the server saw this mint) ->
+  // GMGN price volume_24h (fallback for mints the server hasn't seen yet).
+  // NOTE: serverClient stores volume: signal.volume24h ?? 0 — a server entry with
+  // missing volume carries 0, so use || (not ??) to let GMGN fill it.
+  const volume = Number(serverVolume || gmgnInfo?.price?.volume_24h || gmgnInfo?.volume_24h || 0) || null;
   return {
     coinMint: mint,
     name: originalData?.name || gmgnInfo?.name || '',
@@ -189,6 +197,7 @@ function buildGraduatedCoin(mint, symbol, gmgnInfo, originalData, patternFlags =
     usd_market_cap: marketCap,
     numHolders: holderCount,
     liquidity: liquidity,
+    volume: volume,
     graduationDate: now(),
     seenAt: now(),
     detectedAt: now(),
@@ -200,7 +209,18 @@ function buildGraduatedCoin(mint, symbol, gmgnInfo, originalData, patternFlags =
 }
 
 async function graduateToken(mint, entry) {
-  const graduatedCoin = buildGraduatedCoin(mint, entry.symbol, entry.gmgnInfo, entry.originalData, entry.patternFlags || []);
+  // Gap E: prefer the signal server's volume24h for this mint if it already landed
+  // in the shared graduated map (serverClient.js:58-67 stores volume there). This
+  // is the author's exact source for graduated_volume. Fall back to GMGN inside
+  // buildGraduatedCoin for mints the server hasn't seen yet (timing race).
+  let serverVolume = null;
+  try {
+    const { graduated } = await import('./graduated.js');
+    serverVolume = graduated.get(mint)?.volume ?? null;
+  } catch (err) {
+    // ignore — GMGN fallback inside buildGraduatedCoin
+  }
+  const graduatedCoin = buildGraduatedCoin(mint, entry.symbol, entry.gmgnInfo, entry.originalData, entry.patternFlags || [], serverVolume);
 
   // Register in graduated map so other modules can reference it
   try {
