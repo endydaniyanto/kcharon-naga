@@ -513,8 +513,18 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
     holders = jupHolders;
     gmgn = gmgnInfo;
     chart = jupChart;
-    twitterNarrative = null;
-    savedWalletExposure = await fetchSavedWalletExposure(mint, holders);
+    // Gap D (2026-08-07): twitter narrative on the fast path — fail-open like Gap A.
+    // Bounded to 3s so a slow fxtwitter call can never delay the fresh-grad entry
+    // path (the fetcher's own 8s x2 timeouts are too long for the live route). A bare
+    // handle (no /status/ URL) returns null immediately via extractTweetUrl, so only
+    // tokens with a real status URL pay any API time. Runs in parallel with the
+    // saved-wallet fetch, matching the non-fast path structure.
+    const walletP = fetchSavedWalletExposure(mint, holders);
+    const twitterP = Promise.race([
+      fetchTwitterNarrative(graduatedCoin || jupiterAsset, gmgnInfo),
+      new Promise((r) => setTimeout(() => r(null), 3000)),
+    ]).catch(() => null);
+    [savedWalletExposure, twitterNarrative] = await Promise.all([walletP, twitterP]);
   } else {
     // Stage 1: parallel — gmgn, asset, holders, chart (4 calls)
     [gmgn, jupiterAsset, holders, chart] = await Promise.all([
