@@ -1,4 +1,4 @@
-import { now, pruneSeen } from '../utils.js';
+import { now, pruneSeen, json } from '../utils.js';
 import { numSetting, boolSetting } from '../db/settings.js';
 import { db } from '../db/connection.js';
 import { upsertCandidate, updateCandidateStatus, recentEligibleCandidates, candidateById } from '../db/candidates.js';
@@ -155,15 +155,23 @@ export async function processCandidateFromSignals(signals) {
   // Momentum filter — ML-based prediction of runner vs sideways.
   // REPORTING-ONLY (2026-08-07): log the score, never gate. Gap F: the author's
   // 0.5 threshold is calibrated on HIS distribution; gating on it would silently
-  // reject ~70% of candidates on an unvalidated black box. Score + reason are
-  // recorded on the candidate (persisted via snapshot_json at entry) and validated
-  // against outcomes before any gate is flipped on.
+  // reject ~70% of candidates on an unvalidated black box. Runs AFTER filters +
+  // prescore (only tradeable candidates get scored — no wasted python spawns).
+  // Re-persist the candidate row after scoring: upsertCandidate ran at line ~116
+  // BEFORE this block, and candidateById re-reads the DB row (verified live:
+  // 0/2661 positions carried momentumScore when it wasn't re-persisted).
   const momentumThreshold = strat.momentum_threshold ?? 0.5;
   const momentumResult = await momentumFilter(candidate, momentumThreshold);
   candidate.filters.momentumScore = momentumResult.score;
   candidate.filters.momentumReason = momentumResult.reason || 'ok';
   candidate.filters.momentumLatencyMs = momentumResult.latency ?? null;
   console.log(`[momentum] ${candidate.token.mint.slice(0, 8)}... REPORT score=${momentumResult.score} threshold=${momentumThreshold} reason=${candidate.filters.momentumReason}${momentumResult.latency != null ? ` (${momentumResult.latency}ms)` : ''}`);
+  try {
+    db.prepare('UPDATE candidates SET candidate_json = ?, filter_result_json = ? WHERE id = ?')
+      .run(json(candidate), json(candidate.filters), candidateId);
+  } catch (err) {
+    console.error(`[momentum] re-persist failed for ${candidate.token.mint.slice(0, 8)}...: ${err.message}`);
+  }
 
   let rows, batchDecision, batchId;
 
