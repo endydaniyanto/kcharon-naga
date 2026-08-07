@@ -44,6 +44,14 @@ export async function refreshCandidateForExecution(row) {
     // Quote retry (2026-08-06): fresh-grad routes often 400/no-route for a beat before the
     // lite-api can route them — retry 3x/750ms so the dry twin gets the quote anchor instead
     // of the stale mark (Bulls 08-05: single attempt failed -> entryAnchor=mark -> dry +107% phantom).
+    // Gap A parity (2026-08-07): buildCandidate now fetches gmgn on the fresh path,
+    // so the execution refresh must too — otherwise the fresh-check filter sees a
+    // different liquidity source (Jupiter vs GMGN) and rejects at the $10K band
+    // (observed: build soft 30 PASS, refresh soft 20 < 30 REJECT on GMGN 11.3K vs
+    // Jupiter 8.3K liquidity). Use the CACHE (default true) — same 5-min object build
+    // used, zero extra GMGN calls, zero pacing latency. Chart stays null: the ATH
+    // distance penalty is !isFreshGrad-gated, so it cannot affect fresh-grad scores.
+    const gmgnP = fetchGmgnTokenInfo(mint);
     const assetP = fetchJupiterAsset(mint, { useCache: false });
     const holdersP = fetchJupiterHolders(mint);
     qp = null;
@@ -53,8 +61,7 @@ export async function refreshCandidateForExecution(row) {
       console.log(`[candidate] quote attempt ${attempt}/3 failed for ${mint.slice(0, 8)}...`);
       if (attempt < 3) await new Promise((r) => setTimeout(r, 750));
     }
-    [asset, holders] = await Promise.all([assetP, holdersP]);
-    gmgn = null;
+    [gmgn, asset, holders] = await Promise.all([gmgnP, assetP, holdersP]);
     chart = null;
   } else {
     [gmgn, asset, holders] = await Promise.all([
