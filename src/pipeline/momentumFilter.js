@@ -34,6 +34,10 @@ export async function momentumFilter(candidate, threshold = DEFAULT_THRESHOLD) {
     const proc = spawn('python3', [PYTHON_SCRIPT], {
       stdio: ['pipe', 'pipe', 'pipe'],
       timeout: TIMEOUT_MS,
+      // Gap python (2026-08-07): railpack installs numpy/sklearn into /app/pylib
+      // (deployOutputs from the python-deps step); the spawned python needs
+      // PYTHONPATH to find them. Env override merges with inherited process.env.
+      env: { ...process.env, PYTHONPATH: '/app/pylib' },
     });
     
     let stdout = '';

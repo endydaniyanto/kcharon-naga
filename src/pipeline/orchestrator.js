@@ -152,17 +152,18 @@ export async function processCandidateFromSignals(signals) {
     return;
   }
 
-  // Momentum filter — ML-based prediction of runner vs sideways
+  // Momentum filter — ML-based prediction of runner vs sideways.
+  // REPORTING-ONLY (2026-08-07): log the score, never gate. Gap F: the author's
+  // 0.5 threshold is calibrated on HIS distribution; gating on it would silently
+  // reject ~70% of candidates on an unvalidated black box. Score + reason are
+  // recorded on the candidate (persisted via snapshot_json at entry) and validated
+  // against outcomes before any gate is flipped on.
   const momentumThreshold = strat.momentum_threshold ?? 0.5;
   const momentumResult = await momentumFilter(candidate, momentumThreshold);
-  if (!momentumResult.passed) {
-    candidate.filters.passed = false;
-    candidate.filters.failures.push(`momentum score ${momentumResult.score} < ${momentumThreshold}`);
-    candidate.filters.momentumScore = momentumResult.score;
-    console.log(`[momentum] filtered ${candidate.token.mint.slice(0, 8)}... score ${momentumResult.score} < ${momentumThreshold}`);
-    return;
-  }
   candidate.filters.momentumScore = momentumResult.score;
+  candidate.filters.momentumReason = momentumResult.reason || 'ok';
+  candidate.filters.momentumLatencyMs = momentumResult.latency ?? null;
+  console.log(`[momentum] ${candidate.token.mint.slice(0, 8)}... REPORT score=${momentumResult.score} threshold=${momentumThreshold} reason=${candidate.filters.momentumReason}${momentumResult.latency != null ? ` (${momentumResult.latency}ms)` : ''}`);
 
   let rows, batchDecision, batchId;
 
