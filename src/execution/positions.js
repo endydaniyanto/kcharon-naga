@@ -337,6 +337,11 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
     } finally {
       sellInProgress.delete(position.id);
     }
+    // A (2026-08-06): when the sell was reconciled from a zero-balance account (the
+    // wallet already exited on-chain but the close write was lost), label the row with
+    // RECONCILED_ZERO_BALANCE instead of the trigger reason so it's auditable as a
+    // recovery, not a normal SL/TP exit. PnL below uses the recovered realized fill.
+    if (sell?.reconciled) exitReason = 'RECONCILED_ZERO_BALANCE';
     const receivedLamports = Number(sell.outputAmount || 0);
     const receivedSol = receivedLamports > 0 ? receivedLamports / 1_000_000_000 : null;
     if (receivedSol != null) {

@@ -52,6 +52,55 @@ export async function fetchLiveTokenBalance(mint) {
   }
 }
 
+// A (2026-08-06): zero-balance sell reconciliation. When the live sell path has exhausted
+// its retries AND the wallet no longer holds the token, the sell already landed on-chain
+// but the close write was lost (response timeout / crash mid-close — TABULL 2026-08-06:
+// buy 04:37:03, sell 04:38:39 at 0.00854 SOL, DB position left OPEN). Scan the wallet's
+// recent txs for a full exit of `mint`, recover the REAL realized output, and hand it back
+// so the caller closes the position with truthful PnL + the real exit signature instead of
+// fabricating a mark-based exit or leaving a zombie row. Returns
+// { signature, outputAmount /* lamports */, reconciled: true } or null when no full exit found.
+export async function recoverZeroBalanceSell(mint, openedAtMs) {
+  if (!liveWallet || !solanaConnection) return null;
+  try {
+    const owner = liveWallet.publicKey.toBase58();
+    const sigs = await solanaConnection.getSignaturesForAddress(
+      liveWallet.publicKey,
+      { limit: 20 },
+      'confirmed',
+    );
+    for (const s of sigs) {
+      const tx = await solanaConnection.getTransaction(s.signature, {
+        encoding: 'json',
+        maxSupportedTransactionVersion: 0,
+      });
+      if (!tx || tx.meta?.err) continue;
+      // Only consider txs after this position opened — avoids finding an OLD exit from a
+      // prior round-trip on the same mint (bot can trade the same mint multiple times).
+      if (openedAtMs && tx.blockTime && tx.blockTime * 1000 < openedAtMs) continue;
+      const pre = (tx.meta?.preTokenBalances || []).filter(b => b.owner === owner && b.mint === mint);
+      const post = (tx.meta?.postTokenBalances || []).filter(b => b.owner === owner && b.mint === mint);
+      const preAmt = pre.length ? Number(pre[0].uiTokenAmount?.amount || 0) : 0;
+      const postAmt = post.length ? Number(post[0].uiTokenAmount?.amount || 0) : 0;
+      if (preAmt > 0 && postAmt === 0) {
+        // Wallet is accountKeys[0] (fee payer): realized output = SOL delta + fee.
+        const receivedLamports = (tx.meta?.postBalances?.[0] || 0) - (tx.meta?.preBalances?.[0] || 0) + (tx.meta?.fee || 0);
+        if (receivedLamports > 0) {
+          return {
+            signature: s.signature,
+            outputAmount: String(receivedLamports),
+            reconciled: true,
+          };
+        }
+      }
+    }
+    return null;
+  } catch (err) {
+    console.log(`[reconcile] ${mint.slice(0, 8)}... lookup failed: ${err.message}`);
+    return null;
+  }
+}
+
 export function requireLiveExecution() {
   if (!liveWallet || !solanaConnection) throw new Error('SOLANA_PRIVATE_KEY is required for live execution.');
   if (!JUPITER_API_KEY) throw new Error('JUPITER_API_KEY is required for live execution.');

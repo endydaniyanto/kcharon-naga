@@ -189,6 +189,31 @@ export async function closePosition(chatId, id, reason) {
   const pnlSol = Number(row.size_sol) * pnlPercent / 100;
   let sell = null;
   if (row.execution_mode === 'live') sell = await executeLiveSell(row, reason);
+  // A (2026-08-06): reconciled zero-balance close — the wallet already exited on-chain
+  // but the close write was lost. Use the recovered realized fill for PnL (not the mark,
+  // which would fabricate an exit) and label the row RECONCILED_ZERO_BALANCE.
+  if (sell?.reconciled) {
+    const receivedSol = Number(sell.outputAmount || 0) / 1e9;
+    if (receivedSol > 0) {
+      reason = 'RECONCILED_ZERO_BALANCE';
+      const realizedPnlSol = receivedSol - Number(row.size_sol);
+      const realizedPnlPercent = (receivedSol / Number(row.size_sol) - 1) * 100;
+      console.log(`[reconcile] #${id} ${row.symbol} manual close zero balance — realized ${realizedPnlSol.toFixed(6)} SOL (${realizedPnlPercent.toFixed(2)}%) sig=${(sell.signature || '-').slice(0, 10)}`);
+      db.prepare(`
+        UPDATE dry_run_positions
+        SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?,
+            pnl_percent = ?, pnl_sol = ?, exit_signature = ?
+        WHERE id = ?
+      `).run(now(), Number(row.entry_price) * (1 + realizedPnlPercent / 100), Number(row.entry_mcap) * (1 + realizedPnlPercent / 100), reason, realizedPnlPercent, realizedPnlSol, sell.signature, id);
+      db.prepare(`
+        INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
+        VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?)
+      `).run(id, row.mint, now(), Number(row.entry_price) * (1 + realizedPnlPercent / 100), Number(row.entry_mcap) * (1 + realizedPnlPercent / 100), row.size_sol, row.token_amount_est, reason, json({ pnlPercent: realizedPnlPercent, pnlSol: realizedPnlSol, receivedSol, reconciled: true, sell }));
+      console.log(`[position] #${id} ${row.symbol} ${row.execution_mode || 'dry_run'} MANUAL CLOSE reason=${reason} pnl=${realizedPnlPercent.toFixed(2)}% pnlSol=${realizedPnlSol.toFixed(4)} sig=${(sell.signature || '-').slice(0, 10)}`);
+      const label2 = row.execution_mode === 'live' ? 'Closed live position' : 'Closed dry-run position';
+      return bot.sendMessage(chatId, `${label2} #${id}: ${escapeHtml(reason)} ${fmtPct(realizedPnlPercent)}`, { parse_mode: 'HTML' });
+    }
+  }
   db.prepare(`
     UPDATE dry_run_positions
     SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?,

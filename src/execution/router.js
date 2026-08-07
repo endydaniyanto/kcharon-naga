@@ -3,7 +3,7 @@ import { numSetting, boolSetting } from '../db/settings.js';
 import { db } from '../db/connection.js';
 import { WSOL_MINT, LIVE_MIN_SOL_RESERVE_LAMPORTS, JUPITER_SLIPPAGE_BPS } from '../config.js';
 import { escapeHtml, fmtSol } from '../format.js';
-import { executeJupiterSwap, liveWalletBalanceLamports, fetchLiveTokenBalance } from '../liveExecutor.js';
+import { executeJupiterSwap, liveWalletBalanceLamports, fetchLiveTokenBalance, recoverZeroBalanceSell } from '../liveExecutor.js';
 import { fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
 import { activeStrategy } from '../db/settings.js';
 import { createLivePosition, canOpenMorePositions, openPositionCount } from '../db/positions.js';
@@ -169,6 +169,30 @@ export async function executeLiveSell(position, reason) {
       console.log(`[sell] attempt ${attempt}/${SELL_MAX_ATTEMPTS} failed for ${position.symbol}: ${err.message}`);
       if (attempt < SELL_MAX_ATTEMPTS) await new Promise((r) => setTimeout(r, 1500));
     }
+  }
+  // A (2026-08-06): zero-balance reconciliation. If every sell attempt failed AND the
+  // wallet no longer holds the token, the sell already landed on-chain but the close
+  // write was lost (response timeout / crash mid-close — TABULL 2026-08-06: buy
+  // 04:37:03, sell 04:38:39 at 0.00854 SOL, DB position left OPEN with tokens). Recover
+  // the REAL realized fill from chain history so the caller closes the position with
+  // truthful PnL + the real exit signature instead of throwing and leaving a zombie row.
+  // Guard: only reconcile when the wallet truly shows 0 (NOT on RPC error / transient
+  // balance-null) — a null balance could mean a genuinely held token the RPC failed to
+  // read, and fabricating a fill on that would be worse than the zombie.
+  try {
+    const balance = await fetchLiveTokenBalance(position.mint);
+    // Full-position sells only: a PARTIAL_TP sell with zero remaining balance should not
+    // be reconciled into a full exit (the partial path tracks its own remaining tokens).
+    if (reason !== 'PARTIAL_TP' && balance !== null && Number(balance) === 0) {
+      const recovered = await recoverZeroBalanceSell(position.mint, Number(position.opened_at_ms) || null);
+      if (recovered) {
+        console.log(`[reconcile] ${position.symbol} ${position.mint.slice(0, 8)}... zero balance — recovered realized sell ${(Number(recovered.outputAmount) / 1e9).toFixed(6)} SOL sig=${recovered.signature.slice(0, 10)}`);
+        return recovered;
+      }
+      console.log(`[reconcile] ${position.symbol} ${position.mint.slice(0, 8)}... zero balance but no recoverable sell tx found`);
+    }
+  } catch (err) {
+    console.log(`[reconcile] ${position.symbol} ${err.message}`);
   }
   throw lastError || new Error('Live sell failed without exception');
 }
