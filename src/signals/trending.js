@@ -76,6 +76,7 @@ export async function fetchJupiterTrendingRows(interval, limit) {
 export async function fetchGmgnTrendingRows(interval, limit) {
   if (gmgnBackoffActive('trending')) return [];
   const payload = await gmgnFetch('/v1/market/rank', {
+    kind: 'trending',
     params: {
       chain: 'sol',
       interval,

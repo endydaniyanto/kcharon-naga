@@ -48,13 +48,18 @@ function appendParams(url, params = {}) {
   }
 }
 
-async function gmgnFetch(pathname, { method = 'GET', params = {}, body = null } = {}) {
+async function gmgnFetch(pathname, { method = 'GET', params = {}, body = null, kind = 'token' } = {}) {
   if (!GMGN_ENABLED) throw new Error('GMGN disabled');
+  // Never send during an active ban — direct callers (trenches/smartMoney/gmgnSignal)
+  // must not keep extending it. Mirrors fetchGmgnTokenInfo's pre-gate at the shared
+  // entry so EVERY path honors the backoff, not just the wrapper functions.
+  if (gmgnBackoffActive(kind)) return null;
   return enqueueGmgn(async () => {
     const url = new URL(`https://openapi.gmgn.ai${pathname}`);
     appendParams(url, params);
     const maxRetries = Math.max(0, Math.floor(numSetting('gmgn_max_retries', 2)));
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (gmgnBackoffActive(kind)) return null; // re-check after queue wait / between retries
       await paceGmgnRequest();
       url.searchParams.set('timestamp', String(Math.floor(now() / 1000)));
       url.searchParams.set('client_id', randomUUID());
@@ -91,6 +96,15 @@ async function gmgnFetch(pathname, { method = 'GET', params = {}, body = null } 
       if (res.ok) return payload;
       const message = gmgnErrorText(res.status, payload, `GMGN ${pathname} ${res.status}`);
       const rateLimited = res.status === 429 || /rate limit|temporarily banned/i.test(String(message));
+      // Register the ban as soon as we see 403/429 — not only after retries exhaust.
+      // Direct callers (trenches/smartMoney/gmgnSignal) never call setGmgnBackoff
+      // themselves; without this, a 429 from those paths re-fires every poll cycle
+      // and self-extends the ban. setGmgnBackoff no-ops unless status is 403/429.
+      if (res.status === 403 || res.status === 429) {
+        const banError = new Error(message);
+        banError.response = { status: res.status, data: payload, headers: Object.fromEntries(res.headers.entries()) };
+        setGmgnBackoff(kind, banError);
+      }
       if (rateLimited && attempt < maxRetries) {
         const retryAfter = Number(res.headers.get('retry-after'));
         const backoffMs = Number.isFinite(retryAfter)
