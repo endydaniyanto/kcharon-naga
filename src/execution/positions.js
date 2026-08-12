@@ -35,15 +35,9 @@ export async function refreshCandidateForExecution(row) {
 
   let gmgn, asset, holders, chart, qp;
 
+  let gmgnP, assetP, holdersP;
   if (isFresh) {
     // Fast path: skip GMGN (Cloudflare blocked) and chart (no data for freshly graduated).
-    // Entry anchor (2026-08-05): also fetch the executable quote — the asset mark lags the
-    // migration reprice (BULLMOJI 3.65x / PEW 1.78x stale); the quote is what the bot can
-    // actually transact at and matched the fill in every observed case. Falls back to the
-    // mark when the quote fails (400/no-route on fresh grads — E2a class).
-    // Quote retry (2026-08-06): fresh-grad routes often 400/no-route for a beat before the
-    // lite-api can route them — retry 3x/750ms so the dry twin gets the quote anchor instead
-    // of the stale mark (Bulls 08-05: single attempt failed -> entryAnchor=mark -> dry +107% phantom).
     // Gap A parity (2026-08-07): buildCandidate now fetches gmgn on the fresh path,
     // so the execution refresh must too — otherwise the fresh-check filter sees a
     // different liquidity source (Jupiter vs GMGN) and rejects at the $10K band
@@ -51,26 +45,35 @@ export async function refreshCandidateForExecution(row) {
     // Jupiter 8.3K liquidity). Use the CACHE (default true) — same 5-min object build
     // used, zero extra GMGN calls, zero pacing latency. Chart stays null: the ATH
     // distance penalty is !isFreshGrad-gated, so it cannot affect fresh-grad scores.
-    const gmgnP = fetchGmgnTokenInfo(mint);
-    const assetP = fetchJupiterAsset(mint, { useCache: false });
-    const holdersP = fetchJupiterHolders(mint);
-    qp = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      qp = await fetchTokenSpotViaQuote(mint).catch(() => null);
-      if (Number.isFinite(qp) && qp > 0) break;
-      console.log(`[candidate] quote attempt ${attempt}/3 failed for ${mint.slice(0, 8)}...`);
-      if (attempt < 3) await new Promise((r) => setTimeout(r, 750));
-    }
-    [gmgn, asset, holders] = await Promise.all([gmgnP, assetP, holdersP]);
-    chart = null;
+    gmgnP = fetchGmgnTokenInfo(mint);
+    assetP = fetchJupiterAsset(mint, { useCache: false });
+    holdersP = fetchJupiterHolders(mint);
   } else {
-    [gmgn, asset, holders] = await Promise.all([
-      fetchGmgnTokenInfo(mint, false),
-      fetchJupiterAsset(mint, { useCache: false }),
-      fetchJupiterHolders(mint),
-    ]);
-    chart = null;  // chart not used in buy path — saves 10s timeout
+    gmgnP = fetchGmgnTokenInfo(mint, false);
+    assetP = fetchJupiterAsset(mint, { useCache: false });
+    holdersP = fetchJupiterHolders(mint);
   }
+  chart = null;  // chart not used in buy path — saves 10s timeout
+  // Entry anchor (2026-08-05→10): fetch the executable quote for ALL routes so the dry
+  // leg enters at the same price the live leg fills at. The asset mark lags the true
+  // price — worst for fresh grads (migration reprice: BULLMOJI 3.65x / PEW 1.78x stale)
+  // but the mark-vs-fill divergence applies to every route. Quote retry (2026-08-06):
+  // lite-api often 400/no-route for a beat before it can route a mint — retry 3x/750ms
+  // so the dry leg gets the quote anchor instead of the stale mark (Bulls 08-05: single
+  // attempt failed -> entryAnchor=mark -> dry +107% phantom). Fail-closed (2026-08-10,
+  // Option A): a route whose quote is unavailable after retries is NEVER mark-anchored —
+  // the dry leg is deferred (queueDeferredDryEntry / twin skip) until a quote recovers.
+  // Live still proceeds; the E1 fill override records its true entry.
+  // Quote loop runs while gmgn/asset/holders are in flight (promises started above) —
+  // keeps the original fresh-path latency profile.
+  qp = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    qp = await fetchTokenSpotViaQuote(mint).catch(() => null);
+    if (Number.isFinite(qp) && qp > 0) break;
+    console.log(`[candidate] quote attempt ${attempt}/3 failed for ${mint.slice(0, 8)}...`);
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 750));
+  }
+  [gmgn, asset, holders] = await Promise.all([gmgnP, assetP, holdersP]);
   const quotePrice = (Number.isFinite(qp) && qp > 0) ? qp : null;
   const selectedTrending = trending.get(mint) || candidate.trending || null;
   const selectedHolders = holders?.holders?.length ? holders : candidate.holders;
@@ -86,12 +89,13 @@ export async function refreshCandidateForExecution(row) {
     candidate.metrics?.marketCapUsd,
     candidate.metrics?.graduatedMarketCapUsd,
   );
-  // Entry anchor (2026-08-05): for fresh grads, prefer the executable-quote-derived
-  // price/mcap over the asset mark (stale right after migration). quoteMcap = quotePrice x supply.
+  // Entry anchor (2026-08-05→10): for ALL routes, prefer the executable-quote-derived
+  // price/mcap over the asset mark (stale after migration and diverges from fill generally).
+  // quoteMcap = quotePrice x supply.
   let entryAnchorSrc = 'mark';
   let effectivePriceUsd = priceUsd;
   let effectiveMarketCapUsd = marketCapUsd;
-  if (isFresh && quotePrice != null) {
+  if (quotePrice != null) {
     const supplyTokens = Number(asset?.totalSupply || asset?.circSupply || 0);
     const quoteMcap = supplyTokens > 0 ? quotePrice * supplyTokens : null;
     if (quoteMcap != null && Number.isFinite(quoteMcap) && quoteMcap > 0) {
@@ -100,9 +104,7 @@ export async function refreshCandidateForExecution(row) {
       effectiveMarketCapUsd = quoteMcap;
     }
   }
-  if (isFresh) {
-    console.log(`[candidate] ${mint.slice(0, 8)}... entry anchor: ${entryAnchorSrc}${entryAnchorSrc === 'quote' ? ` (mcap ${effectiveMarketCapUsd.toFixed(0)}, mark was ${marketCapUsd.toFixed(0)})` : ' (quote unavailable after retries — live pre-fill uses mark, dry twin will be SKIPPED)'}`);
-  }
+  console.log(`[candidate] ${mint.slice(0, 8)}... entry anchor: ${entryAnchorSrc}${entryAnchorSrc === 'quote' ? ` (mcap ${effectiveMarketCapUsd.toFixed(0)}, mark was ${marketCapUsd.toFixed(0)})` : ' (quote unavailable after retries — dry leg will be DEFERRED, live uses fill)'}`);
   const refreshed = {
     ...candidate,
     token: {
@@ -491,7 +493,9 @@ async function maybeCreateDeferredTwin(position, prefetched) {
     if (!(Number.isFinite(qp) && qp > 0)) return;
     const snap = typeof position.snapshot_json === 'string' ? JSON.parse(position.snapshot_json || '{}') : (position.snapshot_json || {});
     const candidate = snap.candidate;
-    if (!candidate || !(candidate.signals?.route || '').includes('pumpportal_graduated')) return;
+    // 2026-08-10: quote-anchor applies to ALL routes — drop the pumpportal-only gate so
+    // non-fresh live routes get their deferred dry twin backfilled too.
+    if (!candidate) return;
     const supply = Number(asset?.totalSupply || asset?.circSupply || 0);
     const quoteMcap = supply > 0 ? qp * supply : null;
     if (!quoteMcap || !Number.isFinite(quoteMcap) || quoteMcap <= 0) return;

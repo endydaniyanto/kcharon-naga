@@ -324,11 +324,12 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
   if (mode === 'dry_run') {
     // FIX #3: Wrap position creation in try-catch to capture execution failures
     let positionId, isNew, pastWinPnlSol, pastWinClosedAtMs;
-    // No-stale-mark guard (2026-08-06): fail-closed for fresh-grad dry entries when the
+    // No-stale-mark guard (2026-08-06): fail-closed for dry entries when the
     // executable-quote anchor is unavailable after retries (entryAnchor=mark) — mirrors
-    // live's FAILED_ENTRY semantics. A mark-anchored fresh-grad dry entry is stale-mark
-    // fiction (Bulls +107% phantom, BULLMOJI +284%, PEW +46%). Only fires on
-    // pumpportal_graduated (entryAnchor is set only there); non-fresh routes keep the mark.
+    // live's FAILED_ENTRY semantics. 2026-08-10 (Option A): quote-anchor now applies to
+    // ALL routes (dual_source/trending/fee/trenches included), so any route whose quote
+    // fails is deferred — never mark-anchored. A mark-anchored dry entry is stale-mark
+    // fiction (Bulls +107% phantom, BULLMOJI +284%, PEW +46%).
     if (freshSelectedRow.candidate.executionRefresh?.entryAnchor === 'mark') {
       console.log(`[dry] entry DEFERRED for ${freshSelectedRow.candidate.token.symbol} ${freshSelectedRow.candidate.token.mint.slice(0, 8)}... — quote anchor unavailable after retries (stale-mark avoidance); will backfill on first successful quote`);
       queueDeferredDryEntry(freshSelectedRow.candidate.token.mint, {
