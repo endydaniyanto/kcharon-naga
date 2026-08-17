@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { fetchTokenSpotViaQuote, fetchJupiterAsset } from '../src/enrichment/jupiter.js';
+import { fetchTokenSpotViaQuote, fetchJupiterAsset, quotePriceToUsd } from '../src/enrichment/jupiter.js';
 import { DB_PATH } from '../src/config.js';
 
 const db = new Database(DB_PATH);
@@ -18,12 +18,16 @@ if (!row) {
 console.log(`Token: ${row.symbol} (${row.mint})`);
 console.log(`Entry: $${row.entry_price}  mcap: $${row.entry_mcap}`);
 
-const [quotePrice, asset] = await Promise.all([
+const [rawQuote, asset] = await Promise.all([
   fetchTokenSpotViaQuote(row.mint),
   fetchJupiterAsset(row.mint, { useCache: false }),
 ]);
 
+// Decimals-aware (2026-08-17): the quote returns raw {outAmount, solUsd}; convert
+// with the token's real decimals (6-dec = 1000 tokens per 1e9 raw, 9-dec = 1 token).
+const quotePrice = rawQuote ? quotePriceToUsd(rawQuote, asset?.decimals) : null;
 const assetPrice = Number(asset?.usdPrice);
+console.log(`Decimals:         ${asset?.decimals ?? 'unknown'}`);
 console.log(`\nQuote API price:   ${quotePrice != null ? `$${quotePrice.toFixed(10)}` : 'null'}`);
 console.log(`Asset API price:  ${Number.isFinite(assetPrice) ? `$${assetPrice.toFixed(10)}` : 'null'}`);
 

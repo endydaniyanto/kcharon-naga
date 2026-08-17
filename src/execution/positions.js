@@ -3,7 +3,7 @@ import { numSetting, boolSetting, strategyById, slippageAdjustedMcap } from '../
 import { db } from '../db/connection.js';
 import { firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn, computeAtrPercent, dynamicStopLossPercent } from '../utils.js';
 import { fetchGmgnTokenInfo } from '../enrichment/gmgn.js';
-import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext, fetchJupiterWalletPnl, fetchTokenSpotViaQuote } from '../enrichment/jupiter.js';
+import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext, fetchJupiterWalletPnl, fetchTokenSpotViaQuote, quotePriceToUsd } from '../enrichment/jupiter.js';
 import { liveWalletPubkey } from '../liveExecutor.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
@@ -66,15 +66,18 @@ export async function refreshCandidateForExecution(row) {
   // Live still proceeds; the E1 fill override records its true entry.
   // Quote loop runs while gmgn/asset/holders are in flight (promises started above) —
   // keeps the original fresh-path latency profile.
-  qp = null;
+  qp = null; // raw quote { outAmount, solUsd } | null
   for (let attempt = 1; attempt <= 3; attempt++) {
     qp = await fetchTokenSpotViaQuote(mint).catch(() => null);
-    if (Number.isFinite(qp) && qp > 0) break;
+    if (qp && Number.isFinite(qp.outAmount) && qp.outAmount > 0) break;
     console.log(`[candidate] quote attempt ${attempt}/3 failed for ${mint.slice(0, 8)}...`);
     if (attempt < 3) await new Promise((r) => setTimeout(r, 750));
   }
   [gmgn, asset, holders] = await Promise.all([gmgnP, assetP, holdersP]);
-  const quotePrice = (Number.isFinite(qp) && qp > 0) ? qp : null;
+  // Decimals-aware conversion (2026-08-17): the raw quote's 1e9 input units equal
+  // 1000 tokens only at 6 decimals; at 9 decimals (SILVERINU etc.) they equal 1 token,
+  // so the old hardcoded /1000 price was 1000x too small. tokenCount = 1e9/10^decimals.
+  const quotePrice = qp ? quotePriceToUsd(qp, asset?.decimals) : null;
   const selectedTrending = trending.get(mint) || candidate.trending || null;
   const selectedHolders = holders?.holders?.length ? holders : candidate.holders;
   const selectedSavedWalletExposure = selectedHolders
@@ -192,7 +195,11 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
         fetchJupiterAsset(position.mint, { useCache: false, ttlMs: 3000 }),
         useQuote ? fetchTokenSpotViaQuote(position.mint) : Promise.resolve(null),
       ]);
-  const quotePrice = (Number.isFinite(qp) && qp > 0) ? qp : null;
+  // Decimals-aware conversion (2026-08-17) — same fix as entry: the raw quote's
+  // 1e9 input units are 1000 tokens only at 6 decimals; at 9 decimals they are
+  // 1 token, so the old /1000 price was 1000x too small. This matters for exit
+  // PnL decisions on 9-decimal tokens. Unknown decimals → null → mark fallback.
+  const quotePrice = qp ? quotePriceToUsd(qp, asset?.decimals) : null;
   const quoteMcap = quotePrice && Number(position.entry_price) > 0
     ? Number(position.entry_mcap) * (quotePrice / Number(position.entry_price))
     : null;
@@ -458,14 +465,16 @@ async function scanDeferredDryEntries() {
     const existing = db.prepare(`SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' AND (execution_mode IS NULL OR execution_mode = 'dry_run') LIMIT 1`).get(mint);
     if (existing) { deferredDryEntries.delete(mint); continue; }
     const qp = await fetchTokenSpotViaQuote(mint).catch(() => null);
-    if (!(Number.isFinite(qp) && qp > 0)) continue;
+    if (!(qp && Number.isFinite(qp.outAmount) && qp.outAmount > 0)) continue;
     const asset = await fetchJupiterAsset(mint, { useCache: false });
+    const quotePrice = quotePriceToUsd(qp, asset?.decimals);
+    if (!quotePrice) continue;
     const supply = Number(asset?.totalSupply || asset?.circSupply || 0);
-    const quoteMcap = supply > 0 ? qp * supply : null;
+    const quoteMcap = supply > 0 ? quotePrice * supply : null;
     if (!quoteMcap || !Number.isFinite(quoteMcap) || quoteMcap <= 0) continue;
     const corrected = {
       ...pending.candidate,
-      metrics: { ...pending.candidate.metrics, priceUsd: qp, marketCapUsd: quoteMcap },
+      metrics: { ...pending.candidate.metrics, priceUsd: quotePrice, marketCapUsd: quoteMcap },
       executionRefresh: { ...(pending.candidate.executionRefresh || {}), entryAnchor: 'quote', deferredTwin: true },
     };
     const result = await createDryRunPosition(pending.candidateId, corrected, pending.decision, `deferred_dry_${pending.batchId || mint.slice(0, 8)}`).catch((err) => {
@@ -490,18 +499,20 @@ async function maybeCreateDeferredTwin(position, prefetched) {
   try {
     const qp = prefetched?.qp;
     const asset = prefetched?.asset;
-    if (!(Number.isFinite(qp) && qp > 0)) return;
+    if (!(qp && Number.isFinite(qp.outAmount) && qp.outAmount > 0)) return;
+    const quotePrice = quotePriceToUsd(qp, asset?.decimals);
+    if (!quotePrice) return;
     const snap = typeof position.snapshot_json === 'string' ? JSON.parse(position.snapshot_json || '{}') : (position.snapshot_json || {});
     const candidate = snap.candidate;
     // 2026-08-10: quote-anchor applies to ALL routes — drop the pumpportal-only gate so
     // non-fresh live routes get their deferred dry twin backfilled too.
     if (!candidate) return;
     const supply = Number(asset?.totalSupply || asset?.circSupply || 0);
-    const quoteMcap = supply > 0 ? qp * supply : null;
+    const quoteMcap = supply > 0 ? quotePrice * supply : null;
     if (!quoteMcap || !Number.isFinite(quoteMcap) || quoteMcap <= 0) return;
     const corrected = {
       ...candidate,
-      metrics: { ...candidate.metrics, priceUsd: qp, marketCapUsd: quoteMcap },
+      metrics: { ...candidate.metrics, priceUsd: quotePrice, marketCapUsd: quoteMcap },
       executionRefresh: { ...(candidate.executionRefresh || {}), entryAnchor: 'quote', deferredTwin: true },
     };
     const twin = await createDryRunPosition(position.candidate_id, corrected, snap.decision || {}, `shadow_twin_deferred_${position.id}`);

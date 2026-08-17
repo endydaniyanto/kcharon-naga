@@ -231,6 +231,11 @@ async function fetchSolUsdPriceCached() {
 
 // Fixed 1000-token reference amount ignores price impact for large sizes —
 // upgrade to position-sized quotes when size_sol > 1.
+// Returns the RAW quote { outAmount, solUsd } (or null) — price conversion is
+// decimals-aware and happens at the call site via quotePriceToUsd(). The old
+// hardcoded /1000 assumed 6-decimal tokens (1e9 raw = 1000 tokens); for
+// 9-decimal tokens 1e9 raw = 1 token, so the price was 1000x too small
+// (SILVERINU entry_mcap $57 on a $79K token, +138541% phantom PnL, 2026-08-17).
 async function fetchTokenSpotViaQuote(mint) {
   const tag = mint.slice(0, 8);
   if (quoteBackoffActive()) {
@@ -247,25 +252,38 @@ async function fetchTokenSpotViaQuote(mint) {
       fetchSolUsdPriceCached(),
       axios.get(url.toString(), { timeout: 10_000, headers: JSON_HEADERS }),
     ]);
-    const outAmount = quoteRes.data?.outAmount;
-    if (!outAmount) {
+    const outAmount = Number(quoteRes.data?.outAmount || 0);
+    if (!(outAmount > 0)) {
       console.log(`[quote] ${tag}... no route (outAmount null) — exit will fall back to mark`);
       return null;
     }
-    const outSol = Number(outAmount) / 1e9;
     if (!Number.isFinite(solUsd) || solUsd <= 0) {
       console.log(`[quote] ${tag}... invalid solUsd (${solUsd}) — exit will fall back to mark`);
       return null;
     }
-    const price = (outSol / 1000) * solUsd;
-    console.log(`[quote] ${tag}... ok price=${price} (outAmount=${outAmount})`);
-    return price;
+    console.log(`[quote] ${tag}... ok outAmount=${outAmount} lamports (${(outAmount / 1e9).toExponential(3)} SOL) solUsd=${solUsd}`);
+    return { outAmount, solUsd };
   } catch (err) {
     setQuoteBackoff(err);
     if (err.response?.status !== 429) console.log(`[quote] ${tag}... ${err.response?.status || ''} ${err.message}`);
     else console.log(`[quote] ${tag}... 429 rate-limited`);
     return null;
   }
+}
+
+// Decimals-aware conversion of a raw quote to USD per token.
+// The quote asks for 1e9 raw input units; tokenCount = 1e9 / 10^decimals.
+// price = (outAmount/1e9 SOL) / tokenCount * solUsd.
+// Returns null when the quote is unusable or decimals unknown (fail-closed —
+// callers defer/fall back to the mark instead of storing a wrong anchor).
+export function quotePriceToUsd(qp, decimals) {
+  if (!qp || !Number.isFinite(qp.outAmount) || qp.outAmount <= 0) return null;
+  if (!Number.isFinite(qp.solUsd) || qp.solUsd <= 0) return null;
+  const dec = Number(decimals);
+  if (!Number.isFinite(dec) || dec < 0) return null;
+  const tokenCount = 1_000_000_000 / Math.pow(10, dec);
+  if (!(tokenCount > 0)) return null;
+  return (qp.outAmount / 1e9) / tokenCount * qp.solUsd;
 }
 
 async function fetchJupiterWalletPnl(walletAddress) {
