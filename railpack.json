@@ -1,15 +1,6 @@
 {
   "$schema": "https://schema.railpack.com",
-  "buildAptPackages": ["python3-pip"],
-  "steps": {
-    "python-deps": {
-      "commands": [
-        "python3 -m pip install --quiet --no-cache-dir --target /app/pylib numpy scikit-learn==1.9.0"
-      ],
-      "deployOutputs": [{ "include": ["pylib"] }]
-    }
-  },
   "deploy": {
-    "aptPackages": ["...", "python3", "fonts-dejavu-core", "fontconfig"]
+    "aptPackages": ["...", "fonts-dejavu-core", "fontconfig"]
   }
 }
